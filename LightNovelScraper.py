@@ -9,7 +9,7 @@ from io import BytesIO
 from typing import Optional, Tuple, List, Dict, TypedDict, Union
 from datetime import datetime
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 # Third-party imports
@@ -18,7 +18,6 @@ from bs4 import BeautifulSoup
 from bs4.element import Comment
 from ebooklib import epub
 from PIL import Image
-from readability import Document
 
 if  platform.system() == 'Windows':
     os.system('color')
@@ -31,82 +30,100 @@ class ChapterData(TypedDict):
 
 @dataclass
 class ScraperConstants:
+    # Network settings
     DEFAULT_TIMEOUT: int = 30
     MAX_RETRIES: int = 3
-    MIN_CONTENT_LENGTH: int = 100
     DEFAULT_REQUESTS_PER_SECOND: float = 20.0
+    USER_AGENT: str = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    
+    # Content validation
+    MIN_CONTENT_LENGTH: int = 100
+    
+    # Image processing
     MAX_COVER_HEIGHT: int = 2400
     COVER_ASPECT_RATIO: float = 2/3
-    USER_AGENT: str = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    NOTE_MARKERS: List[str] = [
+    JPEG_QUALITY: int = 95
+    
+    # Rate limiting
+    MAX_BACKOFF_TIME: int = 300
+    RETRY_DELAY_MULTIPLIER: int = 5
+    RATE_LIMITER_QUEUE_SIZE: int = 10
+    
+    # UI
+    PROGRESS_BAR_LENGTH: int = 50
+    
+    # Content markers
+    NOTE_MARKERS: List[str] = field(default_factory=lambda: [
         't/n:', 'tn:', 't/l:', 'tl:',
         'translator\'s note:', 'translator note:',
         'chapter note:', 'chapter note by',
         'thanks for playing', 'as always'
-    ]
-    STRONG_NOTE_MARKERS: List[str] = [
+    ])
+    
+    STRONG_NOTE_MARKERS: List[str] = field(default_factory=lambda: [
         'translator\'s note', 'translator note',
         'chapter note', 't/n', 'note'
-    ]
-    AD_SELECTORS: List[str] = [
+    ])
+    
+    # Content cleaning
+    AD_SELECTORS: List[str] = field(default_factory=lambda: [
         'script', '.CTGIiSmv', '.L-MHncuP', '.vm-placement', 
         'div[data-defid]', 'div[data-mobid]'
-    ]
-    MAX_BACKOFF_TIME: int = 300
-    RETRY_DELAY_MULTIPLIER: int = 5
-    RATE_LIMITER_QUEUE_SIZE: int = 10
+    ])
+    
+    # EPUB styling
     EPUB_FONT_FAMILY: str = 'Times New Roman, serif'
     EPUB_MARGIN: str = '5%'
     EPUB_LINE_HEIGHT: str = '1.6'
     EPUB_HEADING_MARGIN: str = '1em 0 2em 0'
-    JPEG_QUALITY: int = 95
-    CSS_STYLE: str = """
-        body { 
-            font-family: Times New Roman, serif; 
-            margin: 5%; 
-            text-align: justify; 
-        }
-        h1 { 
-            text-align: center; 
-            font-size: 2em;
-            margin: 1em 0 2em 0;
-        }
-        h2 { margin-top: 2em; }
-        h3 { margin-top: 1.5em; }
-        p { margin: 1em 0; }
-        .chapter-content {
+    
+    # Add CSS styling
+    CSS_STYLE: str = field(default_factory=lambda: """
+        body {
+            font-family: Times New Roman, serif;
+            margin: 5%;
             line-height: 1.6;
         }
-        .footnotes {
-            margin-top: 3em;
-            font-size: 0.9em;
-            border-top: 1px solid #cccccc;
-            padding-top: 1em;
+        h1, h2, h3, h4, h5, h6 {
+            text-align: center;
+            margin: 1em 0 2em 0;
+        }
+        p {
+            text-indent: 1.5em;
+            margin: 0;
+        }
+        .separator {
+            text-align: center;
+            margin: 1em 0;
         }
         .footnote {
-            margin: 0.5em 0;
             font-size: 0.9em;
+            color: #666;
+            margin: 1em 0;
+            padding: 0.5em;
+            border: 1px solid #ddd;
+            background-color: #f9f9f9;
         }
-        .chapter-notes {
-            margin-top: 3em;
-            padding-top: 1em;
-            border-top: 1px solid #ccc;
-            font-size: 0.9em;
+        img {
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 1em auto;
         }
-        .note {
+        .chapter-title {
+            font-size: 1.5em;
+            font-weight: bold;
+            text-align: center;
+            margin: 2em 0;
+        }
+        .author-note {
             font-style: italic;
-            margin: 0.5em 0;
-        }
-        sup {
-            vertical-align: super;
-            font-size: 0.8em;
-        }
-        a {
-            color: #000000;
-            text-decoration: none;
+            margin: 1em 0;
+            padding: 0.5em;
+            border-left: 3px solid #ddd;
         }
     """
-    PROGRESS_BAR_LENGTH: int = 50
+    .strip())
 
 @dataclass
 class Config:
@@ -130,79 +147,91 @@ class ConsoleColors:
     RESET: str = '\033[0m'
 
 class ValidationError(Exception):
-    """Custom exception for validation errors."""
-    pass
-
-class ScraperError(Exception):
-    """Custom exception for scraper-specific errors."""
+    """Raised when input validation fails."""
     pass
 
 class RateLimiter:
     """Rate limiting implementation with exponential backoff."""
    
-    def __init__(self, requests_per_second: float = ScraperConstants.DEFAULT_REQUESTS_PER_SECOND):
-        self.rate = requests_per_second
-        self.min_interval = 1.0 / requests_per_second
-        self.last_request_times = deque(maxlen=ScraperConstants.RATE_LIMITER_QUEUE_SIZE)
-        self.failed_attempts = 0
-       
+    def __init__(self, requests_per_second: float = ScraperConstants().DEFAULT_REQUESTS_PER_SECOND):
+        self._rate = requests_per_second
+        self._min_interval = 1.0 / requests_per_second
+        self._last_request_times: deque = deque(maxlen=ScraperConstants().RATE_LIMITER_QUEUE_SIZE)
+        self._failed_attempts = 0
+    
+    @property
+    def current_delay(self) -> float:
+        """Calculate current delay based on failed attempts."""
+        if self._failed_attempts == 0:
+            return 0
+        return min(ScraperConstants().MAX_BACKOFF_TIME, 
+                  (2 ** self._failed_attempts) - 1)
+    
     def wait(self) -> None:
         """Wait appropriate time between requests with exponential backoff."""
         now = datetime.now()
         
-        if self.last_request_times:
-            elapsed = (now - self.last_request_times[-1]).total_seconds()
-            wait_time = max(0, self.min_interval - elapsed)
-        else:
-            wait_time = 0
-
-        if self.failed_attempts > 0:
-            wait_time += min(ScraperConstants.MAX_BACKOFF_TIME, 
-                            (2 ** self.failed_attempts) - 1)
+        base_wait = (self._min_interval - (now - self._last_request_times[-1]).total_seconds()) if self._last_request_times else 0
+        total_wait = max(0, base_wait + self.current_delay)
             
-        if wait_time > 0:
-            time.sleep(wait_time)
+        if total_wait > 0:
+            time.sleep(total_wait)
             
-        self.last_request_times.append(datetime.now())
+        self._last_request_times.append(now)
     
     def record_failure(self) -> None:
-        self.failed_attempts += 1
+        """Record a failed attempt and increase backoff."""
+        self._failed_attempts += 1
     
     def record_success(self) -> None:
-        self.failed_attempts = 0
+        """Record a successful attempt and reset backoff."""
+        self._failed_attempts = 0
 
 class ProgressTracker:
     def __init__(self, total: int):
-        self.total = total
-        self.current = 0
-        self.success = 0
-        self.failures = 0
+        self._total = total
+        self._current = 0
+        self._success = 0
+        self._failures = 0
+    
+    @property
+    def success_count(self) -> int:
+        return self._success
+    
+    @property
+    def failure_count(self) -> int:
+        return self._failures
+    
+    @property
+    def completion_percentage(self) -> float:
+        return (self._current / self._total) * 100
         
     def update(self, success: bool = True) -> None:
-        self.current += 1
+        """Update progress with success/failure status."""
+        self._current += 1
         if success:
-            self.success += 1
+            self._success += 1
         else:
-            self.failures += 1
+            self._failures += 1
         self._display_progress()
     
     def _display_progress(self) -> None:
-        percent = (self.current / self.total) * 100
-        bar_length = ScraperConstants.PROGRESS_BAR_LENGTH
-        filled_length = int(bar_length * self.current // self.total)
-        bar = '=' * filled_length + '-' * (bar_length - filled_length)
+        """Display progress bar and statistics."""
+        filled_length = int(ScraperConstants().PROGRESS_BAR_LENGTH * self._current // self._total)
+        bar = '=' * filled_length + '-' * (ScraperConstants().PROGRESS_BAR_LENGTH - filled_length)
         
-        stats = f"Success: {self.success} Failures: {self.failures}"
-        print(f'\rProgress |{bar}| {percent:.1f}% {stats}', end='', flush=True)
+        stats = f"Success: {self._success} Failures: {self._failures}"
+        print(f'\rProgress |{bar}| {self.completion_percentage:.1f}% {stats}', end='', flush=True)
 
 class LightNovelScraper:
     def __init__(self, debug_mode: bool = False):
         self._initialize_logging(debug_mode)
-        self.headers = {'User-Agent': ScraperConstants.USER_AGENT}
+        self.headers = {'User-Agent': ScraperConstants().USER_AGENT}
         self.rate_limiter = RateLimiter()
         self.debug_mode = debug_mode
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        self.constants = ScraperConstants()
 
     def _initialize_logging(self, debug_mode: bool) -> None:
         log_level = logging.DEBUG if debug_mode else logging.INFO
@@ -229,7 +258,7 @@ class LightNovelScraper:
             raise ValidationError("Invalid cover image URL")
 
         try:
-            response = self.session.get(image_url, timeout=ScraperConstants.DEFAULT_TIMEOUT)
+            response = self.session.get(image_url, timeout=ScraperConstants().DEFAULT_TIMEOUT)
             response.raise_for_status()
             
             image = Image.open(BytesIO(response.content))
@@ -237,7 +266,7 @@ class LightNovelScraper:
                 image = image.convert('RGB')
             
             width, height = image.size
-            target_ratio = ScraperConstants.COVER_ASPECT_RATIO
+            target_ratio = ScraperConstants().COVER_ASPECT_RATIO
             current_ratio = width/height
             
             if current_ratio != target_ratio:
@@ -250,13 +279,13 @@ class LightNovelScraper:
                     top = (height - new_height) // 2
                     image = image.crop((0, top, width, top + new_height))
             
-            if height > ScraperConstants.MAX_COVER_HEIGHT:
-                new_height = ScraperConstants.MAX_COVER_HEIGHT
+            if height > ScraperConstants().MAX_COVER_HEIGHT:
+                new_height = ScraperConstants().MAX_COVER_HEIGHT
                 new_width = int(new_height * target_ratio)
                 image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
             
             img_byte_arr = BytesIO()
-            image.save(img_byte_arr, format='JPEG', quality=ScraperConstants.JPEG_QUALITY)
+            image.save(img_byte_arr, format='JPEG', quality=ScraperConstants().JPEG_QUALITY)
             return img_byte_arr.getvalue(), 'image/jpeg', 'cover.jpg'
             
         except Exception as e:
@@ -273,7 +302,7 @@ class LightNovelScraper:
         content_div = BeautifulSoup(content_str, 'html.parser')
         
         # Remove specific ad-related elements
-        for selector in ScraperConstants.AD_SELECTORS:
+        for selector in self.constants.AD_SELECTORS:
             for element in content_div.select(selector):
                 element.decompose()
         
@@ -294,12 +323,12 @@ class LightNovelScraper:
         strong_elements = p_element.find_all(['strong', 'b'])
         for strong in strong_elements:
             strong_text = strong.text.strip().lower()
-            if any(note_type in strong_text for note_type in ScraperConstants.STRONG_NOTE_MARKERS):
+            if any(note_type in strong_text for note_type in self.constants.STRONG_NOTE_MARKERS):
                 return True
 
         # Then check regular text patterns
         text_lower = text.lower()
-        return any(pattern in text_lower for pattern in ScraperConstants.NOTE_MARKERS)
+        return any(pattern in text_lower for pattern in self.constants.NOTE_MARKERS)
 
     def _process_content(
         self, 
@@ -375,38 +404,38 @@ class LightNovelScraper:
         if not self.validate_url(url):
             raise ValidationError("Invalid chapter URL")
 
-        for attempt in range(ScraperConstants.MAX_RETRIES):
+        for attempt in range(ScraperConstants().MAX_RETRIES):
             try:
                 self.rate_limiter.wait()
                 
-                response = self.session.get(url, timeout=ScraperConstants.DEFAULT_TIMEOUT)
+                response = self.session.get(url, timeout=ScraperConstants().DEFAULT_TIMEOUT)
                 response.raise_for_status()
                 
                 if not response.text.strip():
                     raise ValueError("Empty response received")
 
-                # Use readability to extract content
-                doc = Document(response.text)
-                content_html = doc.summary()
+                # Parse content directly with BeautifulSoup instead of using readability
+                soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Fallback to traditional parsing if content is too short
-                if len(content_html) <= ScraperConstants.MIN_CONTENT_LENGTH:
-                    if self.debug_mode:
-                        print(f"\n{ConsoleColors.YELLOW}Readability extraction failed, falling back to traditional parsing{ConsoleColors.RESET}")
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    content_div = soup.find('div', id='chapter-container')
+                # Try to find the main content container
+                content_div = soup.find('div', id='chapter-container')
+                if not content_div:
+                    # Fallback to other common content containers
+                    content_div = (
+                        soup.find('div', class_='chapter-content') or
+                        soup.find('article') or
+                        soup.find('div', class_='entry-content')
+                    )
                     if not content_div:
                         raise ValueError("Content container not found")
-                    content_html = str(content_div)
                 
-                # Parse the processed content
-                content_soup = BeautifulSoup(content_html, 'html.parser')
-                
-                # Get title (try readability first, then fallback)
-                chapter_title = doc.short_title()
-                if not chapter_title:
-                    title_elem = content_soup.find('span', class_='chapter-title')
-                    chapter_title = self._process_chapter_title(title_elem, url)
+                # Get title
+                title_elem = (
+                    soup.find('span', class_='chapter-title') or
+                    soup.find('h1') or
+                    soup.find('title')
+                )
+                chapter_title = self._process_chapter_title(title_elem, url)
                 
                 if not chapter_title:
                     raise ValueError("Chapter title not found")
@@ -415,7 +444,7 @@ class LightNovelScraper:
                     print(f"\nProcessing chapter: {chapter_title}")
                     print(f"URL: {url}")
 
-                paragraphs, after_separator, footnotes, debug_notes = self._process_content(content_soup)
+                paragraphs, after_separator, footnotes, debug_notes = self._process_content(content_div)
 
                 # Add content validation
                 if len(paragraphs) < 1:
@@ -423,7 +452,7 @@ class LightNovelScraper:
                     return None, None, None, None
                 
                 total_content_length = sum(len(p) for p in paragraphs)
-                if total_content_length < ScraperConstants.MIN_CONTENT_LENGTH:
+                if total_content_length < ScraperConstants().MIN_CONTENT_LENGTH:
                     self.logger.warning(f"Content length ({total_content_length}) below minimum threshold for {url}")
                     if self.debug_mode:
                         print(f"\n{ConsoleColors.YELLOW}Warning: Chapter content length ({total_content_length}) is unusually short{ConsoleColors.RESET}")
@@ -452,8 +481,8 @@ class LightNovelScraper:
                     import traceback
                     self.logger.error(traceback.format_exc())
                 self.rate_limiter.record_failure()
-                if attempt < ScraperConstants.MAX_RETRIES - 1:
-                    time.sleep((attempt + 1) * ScraperConstants.RETRY_DELAY_MULTIPLIER)
+                if attempt < ScraperConstants().MAX_RETRIES - 1:
+                    time.sleep((attempt + 1) * ScraperConstants().RETRY_DELAY_MULTIPLIER)
                 else:
                     return None, None, None, None
 
@@ -528,8 +557,8 @@ class EpubCreator:
         )
         
         chapter_content = [
-            f'<h1 style="margin: {ScraperConstants.EPUB_HEADING_MARGIN}">{chapter_data["title"]}</h1>',
-            f'<div class="chapter-content" style="line-height: {ScraperConstants.EPUB_LINE_HEIGHT}">',
+            f'<h1 style="margin: {ScraperConstants().EPUB_HEADING_MARGIN}">{chapter_data["title"]}</h1>',
+            f'<div class="chapter-content" style="line-height: {ScraperConstants().EPUB_LINE_HEIGHT}">',
             chapter_data['content']
         ]
 
@@ -550,7 +579,7 @@ class EpubCreator:
             '<div class="footnotes" style="margin-top: 3em; font-size: 0.9em;">',
             '<hr/>',
             '<h3>Footnotes</h3>',
-            *[f'<p id="footnote-{num}" class="footnote" style="margin: {ScraperConstants.EPUB_MARGIN}">'
+            *[f'<p id="footnote-{num}" class="footnote" style="margin: {ScraperConstants().EPUB_MARGIN}">'
               f'<sup>{num}</sup> {text} <a href="#ref-{num}">↩</a></p>'
               for num, text in footnotes.items()],
             '</div>'
@@ -560,7 +589,7 @@ class EpubCreator:
         return [
             '<div class="chapter-notes" style="margin-top: 3em; padding-top: 1em;">',
             '<hr/>',
-            f'<h3 style="font-family: {ScraperConstants.EPUB_FONT_FAMILY}">Chapter Notes</h3>',
+            f'<h3 style="font-family: {ScraperConstants().EPUB_FONT_FAMILY}">Chapter Notes</h3>',
             *notes,
             '</div>'
         ]
@@ -580,7 +609,7 @@ class EpubCreator:
             uid="style_nav",
             file_name="style/nav.css",
             media_type="text/css",
-            content=ScraperConstants.CSS_STYLE
+            content=ScraperConstants().CSS_STYLE
         )
         self.book.add_item(nav_css)
 
@@ -788,8 +817,8 @@ def main() -> None:
                     epub.write_epub(epub_filename, epub_creator.book, {})
                     print(f"\n{ConsoleColors.GREEN}Successfully created: {epub_filename}{ConsoleColors.RESET}")
                     print(f"Total chapters: {len(chapters_data)}")
-                    print(f"Successful: {progress.success}")
-                    print(f"Failed: {progress.failures}")
+                    print(f"Successful: {progress.success_count}")
+                    print(f"Failed: {progress.failure_count}")
                 except Exception as e:
                     print(f"\n{ConsoleColors.RED}Error creating EPUB file: {str(e)}{ConsoleColors.RESET}")
             else:
