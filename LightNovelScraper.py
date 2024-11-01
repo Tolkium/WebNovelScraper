@@ -1,20 +1,24 @@
-import requests
-from bs4 import BeautifulSoup
-from ebooklib import epub
-from datetime import datetime
-from collections import deque
-import logging
-import time
-import re
-from typing import Optional, Tuple, List, Dict, TypedDict, Union
-from bs4.element import Comment
+# Standard library imports
 import os
-from PIL import Image
-from io import BytesIO
+import re
+import time
+import logging
 import platform
 import argparse
+from io import BytesIO
+from typing import Optional, Tuple, List, Dict, TypedDict, Union
+from datetime import datetime
+from collections import deque
 from dataclasses import dataclass
 from urllib.parse import urlparse
+
+# Third-party imports
+import requests
+from bs4 import BeautifulSoup
+from bs4.element import Comment
+from ebooklib import epub
+from PIL import Image
+from readability import Document
 
 if  platform.system() == 'Windows':
     os.system('color')
@@ -34,6 +38,75 @@ class ScraperConstants:
     MAX_COVER_HEIGHT: int = 2400
     COVER_ASPECT_RATIO: float = 2/3
     USER_AGENT: str = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    NOTE_MARKERS: List[str] = [
+        't/n:', 'tn:', 't/l:', 'tl:',
+        'translator\'s note:', 'translator note:',
+        'chapter note:', 'chapter note by',
+        'thanks for playing', 'as always'
+    ]
+    STRONG_NOTE_MARKERS: List[str] = [
+        'translator\'s note', 'translator note',
+        'chapter note', 't/n', 'note'
+    ]
+    AD_SELECTORS: List[str] = [
+        'script', '.CTGIiSmv', '.L-MHncuP', '.vm-placement', 
+        'div[data-defid]', 'div[data-mobid]'
+    ]
+    MAX_BACKOFF_TIME: int = 300
+    RETRY_DELAY_MULTIPLIER: int = 5
+    RATE_LIMITER_QUEUE_SIZE: int = 10
+    EPUB_FONT_FAMILY: str = 'Times New Roman, serif'
+    EPUB_MARGIN: str = '5%'
+    EPUB_LINE_HEIGHT: str = '1.6'
+    EPUB_HEADING_MARGIN: str = '1em 0 2em 0'
+    JPEG_QUALITY: int = 95
+    CSS_STYLE: str = """
+        body { 
+            font-family: Times New Roman, serif; 
+            margin: 5%; 
+            text-align: justify; 
+        }
+        h1 { 
+            text-align: center; 
+            font-size: 2em;
+            margin: 1em 0 2em 0;
+        }
+        h2 { margin-top: 2em; }
+        h3 { margin-top: 1.5em; }
+        p { margin: 1em 0; }
+        .chapter-content {
+            line-height: 1.6;
+        }
+        .footnotes {
+            margin-top: 3em;
+            font-size: 0.9em;
+            border-top: 1px solid #cccccc;
+            padding-top: 1em;
+        }
+        .footnote {
+            margin: 0.5em 0;
+            font-size: 0.9em;
+        }
+        .chapter-notes {
+            margin-top: 3em;
+            padding-top: 1em;
+            border-top: 1px solid #ccc;
+            font-size: 0.9em;
+        }
+        .note {
+            font-style: italic;
+            margin: 0.5em 0;
+        }
+        sup {
+            vertical-align: super;
+            font-size: 0.8em;
+        }
+        a {
+            color: #000000;
+            text-decoration: none;
+        }
+    """
+    PROGRESS_BAR_LENGTH: int = 50
 
 @dataclass
 class Config:
@@ -70,7 +143,7 @@ class RateLimiter:
     def __init__(self, requests_per_second: float = ScraperConstants.DEFAULT_REQUESTS_PER_SECOND):
         self.rate = requests_per_second
         self.min_interval = 1.0 / requests_per_second
-        self.last_request_times = deque(maxlen=10)
+        self.last_request_times = deque(maxlen=ScraperConstants.RATE_LIMITER_QUEUE_SIZE)
         self.failed_attempts = 0
        
     def wait(self) -> None:
@@ -84,12 +157,13 @@ class RateLimiter:
             wait_time = 0
 
         if self.failed_attempts > 0:
-            wait_time += min(300, (2 ** self.failed_attempts) - 1)
+            wait_time += min(ScraperConstants.MAX_BACKOFF_TIME, 
+                            (2 ** self.failed_attempts) - 1)
             
         if wait_time > 0:
             time.sleep(wait_time)
             
-        self.last_request_times.append(now)
+        self.last_request_times.append(datetime.now())
     
     def record_failure(self) -> None:
         self.failed_attempts += 1
@@ -114,7 +188,7 @@ class ProgressTracker:
     
     def _display_progress(self) -> None:
         percent = (self.current / self.total) * 100
-        bar_length = 50
+        bar_length = ScraperConstants.PROGRESS_BAR_LENGTH
         filled_length = int(bar_length * self.current // self.total)
         bar = '=' * filled_length + '-' * (bar_length - filled_length)
         
@@ -182,7 +256,7 @@ class LightNovelScraper:
                 image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
             
             img_byte_arr = BytesIO()
-            image.save(img_byte_arr, format='JPEG', quality=95)
+            image.save(img_byte_arr, format='JPEG', quality=ScraperConstants.JPEG_QUALITY)
             return img_byte_arr.getvalue(), 'image/jpeg', 'cover.jpg'
             
         except Exception as e:
@@ -199,10 +273,7 @@ class LightNovelScraper:
         content_div = BeautifulSoup(content_str, 'html.parser')
         
         # Remove specific ad-related elements
-        for selector in [
-            'script', '.CTGIiSmv', '.L-MHncuP', '.vm-placement', 
-            'div[data-defid]', 'div[data-mobid]'
-        ]:
+        for selector in ScraperConstants.AD_SELECTORS:
             for element in content_div.select(selector):
                 element.decompose()
         
@@ -223,22 +294,17 @@ class LightNovelScraper:
         strong_elements = p_element.find_all(['strong', 'b'])
         for strong in strong_elements:
             strong_text = strong.text.strip().lower()
-            if any(note_type in strong_text for note_type in [
-                'translator\'s note', 'translator note',
-                'chapter note', 't/n', 'note'
-            ]):
+            if any(note_type in strong_text for note_type in ScraperConstants.STRONG_NOTE_MARKERS):
                 return True
 
         # Then check regular text patterns
         text_lower = text.lower()
-        return any(pattern in text_lower for pattern in [
-            't/n:', 'tn:', 't/l:', 'tl:',
-            'translator\'s note:', 'translator note:',
-            'chapter note:', 'chapter note by',
-            'thanks for playing', 'as always'
-        ])
+        return any(pattern in text_lower for pattern in ScraperConstants.NOTE_MARKERS)
 
-    def _process_content(self, content_div: BeautifulSoup) -> Tuple[List[str], List[str], Dict[str, str], List[str]]:
+    def _process_content(
+        self, 
+        content_div: BeautifulSoup
+    ) -> Tuple[List[str], List[str], Dict[str, str], List[str]]:
         """Process and extract content components."""
         content_div = self._clean_html_content(content_div)
         
@@ -318,32 +384,49 @@ class LightNovelScraper:
                 
                 if not response.text.strip():
                     raise ValueError("Empty response received")
+
+                # Use readability to extract content
+                doc = Document(response.text)
+                content_html = doc.summary()
                 
-                # First parse the full HTML
-                soup = BeautifulSoup(response.text, 'html.parser')
+                # Fallback to traditional parsing if content is too short
+                if len(content_html) <= ScraperConstants.MIN_CONTENT_LENGTH:
+                    if self.debug_mode:
+                        print(f"\n{ConsoleColors.YELLOW}Readability extraction failed, falling back to traditional parsing{ConsoleColors.RESET}")
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    content_div = soup.find('div', id='chapter-container')
+                    if not content_div:
+                        raise ValueError("Content container not found")
+                    content_html = str(content_div)
                 
-                title_elem = soup.find('span', class_='chapter-title')
-                chapter_title = self._process_chapter_title(title_elem, url)
+                # Parse the processed content
+                content_soup = BeautifulSoup(content_html, 'html.parser')
+                
+                # Get title (try readability first, then fallback)
+                chapter_title = doc.short_title()
+                if not chapter_title:
+                    title_elem = content_soup.find('span', class_='chapter-title')
+                    chapter_title = self._process_chapter_title(title_elem, url)
                 
                 if not chapter_title:
                     raise ValueError("Chapter title not found")
-
-                # Find the chapter container and process its content
-                content_div = soup.find('div', id='chapter-container')
-                if not content_div:
-                    raise ValueError("Content container not found")
 
                 if self.debug_mode:
                     print(f"\nProcessing chapter: {chapter_title}")
                     print(f"URL: {url}")
 
-                paragraphs, after_separator, footnotes, debug_notes = self._process_content(content_div)
+                paragraphs, after_separator, footnotes, debug_notes = self._process_content(content_soup)
 
-                if len(paragraphs) == 0:
+                # Add content validation
+                if len(paragraphs) < 1:
+                    self.logger.error(f"No valid paragraphs found for {url}")
+                    return None, None, None, None
+                
+                total_content_length = sum(len(p) for p in paragraphs)
+                if total_content_length < ScraperConstants.MIN_CONTENT_LENGTH:
+                    self.logger.warning(f"Content length ({total_content_length}) below minimum threshold for {url}")
                     if self.debug_mode:
-                        print("\nNo paragraphs found in content. Raw content:")
-                        print(content_div.prettify())
-                    raise ValueError("No valid content found")
+                        print(f"\n{ConsoleColors.YELLOW}Warning: Chapter content length ({total_content_length}) is unusually short{ConsoleColors.RESET}")
 
                 content = self._format_chapter_content(paragraphs, footnotes)
                 
@@ -355,14 +438,22 @@ class LightNovelScraper:
                 self.rate_limiter.record_success()
                 return chapter_title, content, after_separator, footnotes
 
+            except requests.Timeout:
+                self.logger.error(f"Request timed out for {url}")
+            except requests.HTTPError as e:
+                self.logger.error(f"HTTP error {e.response.status_code} for {url}")
+            except requests.RequestException as e:
+                self.logger.error(f"Request failed for {url}: {str(e)}")
+            except ValueError as e:
+                self.logger.error(f"Content parsing error for {url}: {str(e)}")
             except Exception as e:
-                self.logger.error(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
+                self.logger.error(f"Unexpected error for {url}: {str(e)}")
                 if self.debug_mode:
                     import traceback
                     self.logger.error(traceback.format_exc())
                 self.rate_limiter.record_failure()
                 if attempt < ScraperConstants.MAX_RETRIES - 1:
-                    time.sleep((attempt + 1) * 5)
+                    time.sleep((attempt + 1) * ScraperConstants.RETRY_DELAY_MULTIPLIER)
                 else:
                     return None, None, None, None
 
@@ -393,6 +484,12 @@ class LightNovelScraper:
         
         return "\n".join(processed_paragraphs)
 
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.session.close()
+
 class EpubCreator:
     def __init__(self, novel_title: str, author: str = "Unknown", 
                     translator: str = "", created_by: str = "LightNovelScraper"):
@@ -420,6 +517,10 @@ class EpubCreator:
         self.book.set_cover(image_name, image_data)
 
     def add_chapter(self, chapter_data: ChapterData, index: int) -> epub.EpubHtml:
+        # Add validation for required fields
+        if not chapter_data['title'] or not chapter_data['content']:
+            raise ValueError("Chapter title and content are required")
+        
         chapter = epub.EpubHtml(
             title=chapter_data['title'],
             file_name=f'chap_{index:03d}.xhtml',
@@ -427,8 +528,8 @@ class EpubCreator:
         )
         
         chapter_content = [
-            f'<h1>{chapter_data["title"]}</h1>',
-            '<div class="chapter-content">',
+            f'<h1 style="margin: {ScraperConstants.EPUB_HEADING_MARGIN}">{chapter_data["title"]}</h1>',
+            f'<div class="chapter-content" style="line-height: {ScraperConstants.EPUB_LINE_HEIGHT}">',
             chapter_data['content']
         ]
 
@@ -446,20 +547,20 @@ class EpubCreator:
 
     def _format_footnotes(self, footnotes: Dict[str, str]) -> List[str]:
         return [
-            '<div class="footnotes">',
+            '<div class="footnotes" style="margin-top: 3em; font-size: 0.9em;">',
             '<hr/>',
             '<h3>Footnotes</h3>',
-            *[f'<p id="footnote-{num}" class="footnote"><sup>{num}</sup> {text} '
-                f'<a href="#ref-{num}">↩</a></p>'
-                for num, text in footnotes.items()],
+            *[f'<p id="footnote-{num}" class="footnote" style="margin: {ScraperConstants.EPUB_MARGIN}">'
+              f'<sup>{num}</sup> {text} <a href="#ref-{num}">↩</a></p>'
+              for num, text in footnotes.items()],
             '</div>'
         ]
 
     def _format_chapter_notes(self, notes: List[str]) -> List[str]:
         return [
-            '<div class="chapter-notes">',
+            '<div class="chapter-notes" style="margin-top: 3em; padding-top: 1em;">',
             '<hr/>',
-            '<h3>Chapter Notes</h3>',
+            f'<h3 style="font-family: {ScraperConstants.EPUB_FONT_FAMILY}">Chapter Notes</h3>',
             *notes,
             '</div>'
         ]
@@ -475,57 +576,11 @@ class EpubCreator:
         self.book.add_item(epub.EpubNav())
 
     def _add_styling(self) -> None:
-        style = """
-            body { 
-                font-family: Times New Roman, serif; 
-                margin: 5%; 
-                text-align: justify; 
-            }
-            h1 { 
-                text-align: center; 
-                font-size: 2em;
-                margin: 1em 0 2em 0;
-            }
-            h2 { margin-top: 2em; }
-            h3 { margin-top: 1.5em; }
-            p { margin: 1em 0; }
-            .chapter-content {
-                line-height: 1.6;
-            }
-            .footnotes {
-                margin-top: 3em;
-                font-size: 0.9em;
-                border-top: 1px solid #cccccc;
-                padding-top: 1em;
-            }
-            .footnote {
-                margin: 0.5em 0;
-                font-size: 0.9em;
-            }
-            .chapter-notes {
-                margin-top: 3em;
-                padding-top: 1em;
-                border-top: 1px solid #ccc;
-                font-size: 0.9em;
-            }
-            .note {
-                font-style: italic;
-                margin: 0.5em 0;
-            }
-            sup {
-                vertical-align: super;
-                font-size: 0.8em;
-            }
-            a {
-                color: #000000;
-                text-decoration: none;
-            }
-        """
         nav_css = epub.EpubItem(
             uid="style_nav",
             file_name="style/nav.css",
             media_type="text/css",
-            content=style
+            content=ScraperConstants.CSS_STYLE
         )
         self.book.add_item(nav_css)
 
@@ -567,14 +622,14 @@ def get_optional_input(prompt: str, arg_value: Optional[str] = None, default: st
 
 def get_user_input(args: argparse.Namespace) -> Dict[str, str]:
     inputs = {}
-    print("\nLight Novel Scraper")
-    print("==================")
-
-    inputs['base_url'] = args.url if args.url else input("\nEnter base URL: ").strip()
-    if not inputs['base_url']:
+    
+    # Validate base URL
+    base_url = args.url if args.url else input("\nEnter base URL: ").strip()
+    if not base_url:
         raise ValidationError("Base URL cannot be empty")
-    if not inputs['base_url'].endswith('/'):
-        inputs['base_url'] += '/'
+    if not urlparse(base_url).scheme:
+        raise ValidationError("Invalid URL format")
+    inputs['base_url'] = base_url if base_url.endswith('/') else base_url + '/'
 
     inputs['novel_id'] = args.novel_id if args.novel_id else input("Novel ID: ").strip()
     if not inputs['novel_id']:
@@ -652,12 +707,16 @@ def get_user_input(args: argparse.Namespace) -> Dict[str, str]:
     return inputs
 
 def main() -> None:
+    print(f"\n{ConsoleColors.GREEN}Light Novel Scraper{ConsoleColors.RESET}")
+    print(f"{ConsoleColors.GREEN}=================={ConsoleColors.RESET}")
+    
     try:
         args = parse_arguments()
         Config.DEBUG_MODE = args.debug
+        Config.validate()
 
         inputs = get_user_input(args)
-
+        
         print("\nFinal Configuration:")
         print(f"Base URL: {inputs['base_url']}")
         print(f"Novel ID: {inputs['novel_id']}")
@@ -681,7 +740,6 @@ def main() -> None:
             print("Aborted by user.")
             return
 
-        scraper = LightNovelScraper(debug_mode=Config.DEBUG_MODE)
         progress = ProgressTracker(inputs['end_chapter'] - inputs['start_chapter'] + 1)
         
         chapters_data = []
@@ -692,49 +750,50 @@ def main() -> None:
             created_by=inputs['created_by']
         )
 
-        if inputs['cover_url']:
-            cover_data = scraper.get_cover_image(inputs['cover_url'])
-            if cover_data:
-                epub_creator.add_cover(cover_data)
+        with LightNovelScraper(debug_mode=Config.DEBUG_MODE) as scraper:
+            if inputs['cover_url']:
+                cover_data = scraper.get_cover_image(inputs['cover_url'])
+                if cover_data:
+                    epub_creator.add_cover(cover_data)
+                else:
+                    print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process cover image{ConsoleColors.RESET}")
+
+            for chapter_num in range(inputs['start_chapter'], inputs['end_chapter'] + 1):
+                url = f"{inputs['base_url']}{inputs['novel_id']}/chapter-{chapter_num}"
+                
+                chapter_title, content, notes, footnotes = scraper.get_chapter_content(url)
+                
+                if chapter_title and content:
+                    chapters_data.append({
+                        'title': chapter_title,
+                        'content': content,
+                        'notes': notes or [],
+                        'footnotes': footnotes or {}
+                    })
+                    progress.update(True)
+                else:
+                    progress.update(False)
+                    print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process chapter {chapter_num}{ConsoleColors.RESET}")
+
+            if chapters_data:
+                epub_chapters = []
+                for idx, chapter_data in enumerate(chapters_data, 1):
+                    chapter = epub_creator.add_chapter(chapter_data, idx)
+                    epub_chapters.append(chapter)
+
+                epub_creator.finalize(epub_chapters)
+                epub_filename = f"{inputs['novel_title'].lower().replace(' ', '_')}.epub"
+                
+                try:
+                    epub.write_epub(epub_filename, epub_creator.book, {})
+                    print(f"\n{ConsoleColors.GREEN}Successfully created: {epub_filename}{ConsoleColors.RESET}")
+                    print(f"Total chapters: {len(chapters_data)}")
+                    print(f"Successful: {progress.success}")
+                    print(f"Failed: {progress.failures}")
+                except Exception as e:
+                    print(f"\n{ConsoleColors.RED}Error creating EPUB file: {str(e)}{ConsoleColors.RESET}")
             else:
-                print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process cover image{ConsoleColors.RESET}")
-
-        for chapter_num in range(inputs['start_chapter'], inputs['end_chapter'] + 1):
-            url = f"{inputs['base_url']}{inputs['novel_id']}/chapter-{chapter_num}"
-            
-            chapter_title, content, notes, footnotes = scraper.get_chapter_content(url)
-            
-            if chapter_title and content:
-                chapters_data.append({
-                    'title': chapter_title,
-                    'content': content,
-                    'notes': notes or [],
-                    'footnotes': footnotes or {}
-                })
-                progress.update(True)
-            else:
-                progress.update(False)
-                print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process chapter {chapter_num}{ConsoleColors.RESET}")
-
-        if chapters_data:
-            epub_chapters = []
-            for idx, chapter_data in enumerate(chapters_data, 1):
-                chapter = epub_creator.add_chapter(chapter_data, idx)
-                epub_chapters.append(chapter)
-
-            epub_creator.finalize(epub_chapters)
-            epub_filename = f"{inputs['novel_title'].lower().replace(' ', '_')}.epub"
-            
-            try:
-                epub.write_epub(epub_filename, epub_creator.book, {})
-                print(f"\n{ConsoleColors.GREEN}Successfully created: {epub_filename}{ConsoleColors.RESET}")
-                print(f"Total chapters: {len(chapters_data)}")
-                print(f"Successful: {progress.success}")
-                print(f"Failed: {progress.failures}")
-            except Exception as e:
-                print(f"\n{ConsoleColors.RED}Error creating EPUB file: {str(e)}{ConsoleColors.RESET}")
-        else:
-            print(f"\n{ConsoleColors.RED}No chapters were successfully scraped.{ConsoleColors.RESET}")
+                print(f"\n{ConsoleColors.RED}No chapters were successfully scraped.{ConsoleColors.RESET}")
 
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
