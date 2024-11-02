@@ -38,3 +38,4 @@ lightnovel_env/
 # Output files
 *.epub
 .cursorignore
+testText.txt
