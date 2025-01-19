@@ -319,11 +319,11 @@ class ProgressTracker:
             terminal_width = os.get_terminal_size().columns
             
             # Reserve space for stats
-            stats = f"Success: {self._success} Failures: {self._failures}"
+            stats = f"Success: {self._success} Failures: {self._failures} "
             reserved_space = len(f"Progress || 100.0% {stats}") + 2
             
             # Calculate bar length
-            bar_length = terminal_width - reserved_space
+            bar_length = (terminal_width // 2) - reserved_space
             filled_length = int(bar_length * self._current // self._total)
             bar = '=' * filled_length + '-' * (bar_length - filled_length)
             
@@ -755,6 +755,55 @@ class ContentExtractor:
                 processed_paragraphs.append(p_clean)
         
         return "\n".join(processed_paragraphs)
+    
+    def extract_chapter_content(
+        self,
+        html_content: str,
+        url: str
+    ) -> Tuple[Optional[str], Optional[str], List[str], Dict[str, str]]:
+        """
+        Extract chapter content from HTML.
+        
+        Args:
+            html_content: Raw HTML content
+            url: URL of the chapter
+            
+        Returns:
+            Tuple of (title, content, notes, footnotes)
+        """
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Find main content div
+            content_div = self._find_content_div(soup)
+            if not content_div:
+                self.logger.error(f"Could not find content div for {url}")
+                return None, None, [], {}
+                
+            # Extract title
+            title = self._extract_title(soup, url)
+            if not title:
+                self.logger.error(f"Could not extract title for {url}")
+                return None, None, [], {}
+                
+            # Process content
+            paragraphs, notes, footnotes = self._process_content(content_div)
+            
+            # Validate content
+            if not self.validator.validate_chapter_content(paragraphs, url):
+                return None, None, [], {}
+                
+            # Format content
+            content = self._format_chapter_content(paragraphs, footnotes)
+            
+            return title, content, notes, footnotes
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting content from {url}: {str(e)}")
+            if self.user_config.debug_mode:
+                import traceback
+                self.logger.error(traceback.format_exc())
+            return None, None, [], {}    
     
 class EpubBuilder:
     """Handle EPUB file creation and structure."""

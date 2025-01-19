@@ -1,0 +1,57 @@
+{
+    "main": {
+        "base_url": "https://fanstranslations.com/novel/",
+        "novel_id": "ill-become-a-villainess-that-will-go-down-in-history",
+        "start_chapter": "1",
+        "end_chapter": "10",
+        "novel_title": "I'll Become a Villainess That Will Go Down in History GUI",
+        "cover_url": "https://fanstranslations.com/wp-content/uploads/2021/12/Ill-Become-a-Villainess-That-Will-Go-Down-in-History-193x278.jpg",
+        "author": "Ookido Izumi",
+        "translator": "Fan's Translations",
+        "creator": "GUI"
+    },
+    "user_config": {
+        "include_footnotes": false,
+        "include_chapter_notes": false,
+        "simple_chapter_names": true,
+        "debug_mode": true,
+        "extraction_methods": [
+            "density"
+        ],
+        "custom_selectors": []
+    },
+    "scraper_config": {
+        "timeout": "30",
+        "max_retries": "3",
+        "requests_per_second": "20.0",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "min_content_length": "100",
+        "max_cover_height": "2400",
+        "cover_aspect_ratio": "0.666667",
+        "jpeg_quality": "120",
+        "max_backoff_time": "300",
+        "retry_delay_multiplier": "5",
+        "rate_limiter_queue_size": "10",
+        "note_markers": [
+            "t/n:",
+            "tn:",
+            "t/l:",
+            "tl:",
+            "translator's note:",
+            "translator note:",
+            "chapter note:",
+            "chapter note by",
+            "thanks for playing",
+            "as always"
+        ],
+        "ad_selectors": [
+            "script",
+            ".CTGIiSmv",
+            ".L-MHncuP",
+            ".vm-placement",
+            "div[data-defid]",
+            "div[data-mobid]"
+        ],
+        "css_style": "body { \n                    font-family: Times New Roman, serif; \n                    margin: 5%; \n                    text-align: justify; \n                }\n                h1 { \n                    text-align: center; \n                    font-size: 2em;\n                    margin: 1em 0 1em 0;\n                }\n                h2 { margin-top: 1em; }\n                h3 { margin-top: 1em; }\n                p { margin: 1em 0; }\n                .chapter-content {\n                    line-height: 1.6;\n                }\n                .footnotes {\n                    margin-top: 3em;\n                    font-size: 0.9em;\n                    border-top: 1px solid #cccccc;\n                    padding-top: 1em;\n                }\n                .footnote {\n                    margin: 0.5em 0;\n                    font-size: 0.9em;\n                }\n                .chapter-notes {\n                    margin-top: 3em;\n                    padding-top: 1em;\n                    border-top: 1px solid #ccc;\n                    font-size: 0.9em;\n                }\n                .note {\n                    font-style: italic;\n                    margin: 0.5em 0;\n                }\n                sup {\n                    vertical-align: super;\n                    font-size: 0.8em;\n                }\n                a {\n                    color: #000000;\n                    text-decoration: none;\n                }"
+    }
+}
