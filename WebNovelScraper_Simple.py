@@ -34,7 +34,7 @@ class RateLimiter:
                 time.sleep(sleep_time)
         self.last_request_times.append(now)
 
-class LightNovelScraper:
+class WebNovelScraper:
     def __init__(self, debug_mode=False):
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -175,7 +175,7 @@ class LightNovelScraper:
             book.set_identifier(f'id_{novel_title.lower().replace(" ", "_")}')
             book.set_title(novel_title)
             book.set_language('en')
-            book.add_author('LightNovelScraper')
+            book.add_author('WebNovelScraper')
 
             chapters = []
             chapter_entries = []
@@ -281,7 +281,7 @@ class LightNovelScraper:
 def main():
     # Set debug mode
     Config.DEBUG_MODE = "--debug" in sys.argv
-    scraper = LightNovelScraper(debug_mode=Config.DEBUG_MODE)
+    scraper = WebNovelScraper(debug_mode=Config.DEBUG_MODE)
     
     # Allow command line arguments for footnotes and chapter notes
     Config.INCLUDE_FOOTNOTES = "--no-footnotes" not in sys.argv
@@ -289,7 +289,7 @@ def main():
     Config.SIMPLE_CHAPTER_NAMES = "--simple-chapters" in sys.argv
     
     try:
-        print("Light Novel Scraper")
+        print("Web Novel Scraper")
         print(f"[Settings: Footnotes: {'On' if Config.INCLUDE_FOOTNOTES else 'Off'}, "
               f"Notes: {'On' if Config.INCLUDE_CHAPTER_NOTES else 'Off'}, "
               f"Simple Chapter Names: {'On' if Config.SIMPLE_CHAPTER_NAMES else 'Off'}]")

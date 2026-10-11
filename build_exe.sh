@@ -1,18 +1,11 @@
 #!/bin/bash
-echo "Building LightNovelScraper executable..."
-echo
-
-echo "Installing requirements..."
-pip3 install -r requirements.txt
-
-echo
-echo "Creating executable..."
-pyinstaller --clean \
-    --onefile \
-    --name LightNovelScraper \
-    --console \
-    --log-level INFO \
-    LightNovelScraper.py
-
-echo
-echo "Build complete! Executable is in the dist folder."
+set -e
+cd -- "$(dirname -- "$0")"
+echo "Building WebNovelScraper executable..."
+if [ ! -x webnovel_env/bin/python ]; then
+    python3 -m venv webnovel_env
+fi
+webnovel_env/bin/python -m pip install --disable-pip-version-check -r requirements.txt
+export PYINSTALLER_CONFIG_DIR="$PWD/build/pyinstaller-cache"
+webnovel_env/bin/python -m PyInstaller --clean --noconfirm WebNovelScraper.spec
+echo "Build complete! The desktop executable is in the dist folder."

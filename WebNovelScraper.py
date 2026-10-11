@@ -11,13 +11,10 @@ from bs4.element import Comment
 import os
 from PIL import Image
 from io import BytesIO
-import platform
 import argparse
 from dataclasses import dataclass
 from urllib.parse import urlparse
-
-if  platform.system() == 'Windows':
-    os.system('color')
+from html import escape
 
 class ChapterData(TypedDict):
     title: str
@@ -33,6 +30,8 @@ class ScraperConstants:
     DEFAULT_REQUESTS_PER_SECOND: float = 20.0
     MAX_COVER_HEIGHT: int = 2400
     COVER_ASPECT_RATIO: float = 2/3
+    TITLE_SELECTOR: str = 'span.chapter-title'
+    CONTENT_SELECTOR: str = '#chapter-container'
     USER_AGENT: str = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 
 @dataclass
@@ -64,14 +63,33 @@ class ScraperError(Exception):
     """Custom exception for scraper-specific errors."""
     pass
 
+class ScraperCancelled(Exception):
+    """A user requested cancellation between requests or during a wait."""
+
+class CallbackLogHandler(logging.Handler):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def emit(self, record):
+        self.callback(self.format(record))
+
 class RateLimiter:
     """Rate limiting implementation with exponential backoff."""
    
-    def __init__(self, requests_per_second: float = ScraperConstants.DEFAULT_REQUESTS_PER_SECOND):
+    def __init__(self, requests_per_second: float = ScraperConstants.DEFAULT_REQUESTS_PER_SECOND, cancel_event=None):
         self.rate = requests_per_second
         self.min_interval = 1.0 / requests_per_second
         self.last_request_times = deque(maxlen=10)
         self.failed_attempts = 0
+        self.cancel_event = cancel_event
+
+    def sleep(self, seconds: float) -> None:
+        if self.cancel_event is not None:
+            if self.cancel_event.wait(max(0, seconds)):
+                raise ScraperCancelled()
+        elif seconds > 0:
+            time.sleep(seconds)
        
     def wait(self) -> None:
         """Wait appropriate time between requests with exponential backoff."""
@@ -86,8 +104,7 @@ class RateLimiter:
         if self.failed_attempts > 0:
             wait_time += min(300, (2 ** self.failed_attempts) - 1)
             
-        if wait_time > 0:
-            time.sleep(wait_time)
+        self.sleep(wait_time)
             
         self.last_request_times.append(now)
     
@@ -121,26 +138,35 @@ class ProgressTracker:
         stats = f"Success: {self.success} Failures: {self.failures}"
         print(f'\rProgress |{bar}| {percent:.1f}% {stats}', end='', flush=True)
 
-class LightNovelScraper:
-    def __init__(self, debug_mode: bool = False):
-        self._initialize_logging(debug_mode)
-        self.headers = {'User-Agent': ScraperConstants.USER_AGENT}
-        self.rate_limiter = RateLimiter()
+class WebNovelScraper:
+    def __init__(self, debug_mode: bool = False, settings=None, constants=None,
+                 cancel_event=None, log_callback=None, log_path='scraper_detailed.log'):
+        self.config = settings if settings is not None else Config
+        self.constants = constants if constants is not None else ScraperConstants
+        self._initialize_logging(debug_mode, log_callback, log_path)
+        self.headers = {'User-Agent': self.constants.USER_AGENT}
+        self.rate_limiter = RateLimiter(self.constants.DEFAULT_REQUESTS_PER_SECOND, cancel_event)
         self.debug_mode = debug_mode
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
-    def _initialize_logging(self, debug_mode: bool) -> None:
+    def _initialize_logging(self, debug_mode: bool, log_callback=None, log_path='scraper_detailed.log') -> None:
         log_level = logging.DEBUG if debug_mode else logging.INFO
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('scraper_detailed.log'),
-                logging.StreamHandler() if debug_mode else logging.NullHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.Logger(__name__, log_level)
+        handlers = [logging.FileHandler(log_path, encoding='utf-8')]
+        if log_callback is not None:
+            handlers.append(CallbackLogHandler(log_callback))
+        elif debug_mode:
+            handlers.append(logging.StreamHandler())
+        for handler in handlers:
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(handler)
+
+    def close(self) -> None:
+        self.session.close()
+        for handler in self.logger.handlers[:]:
+            handler.close()
+            self.logger.removeHandler(handler)
 
     def validate_url(self, url: str) -> bool:
         try:
@@ -155,7 +181,7 @@ class LightNovelScraper:
             raise ValidationError("Invalid cover image URL")
 
         try:
-            response = self.session.get(image_url, timeout=ScraperConstants.DEFAULT_TIMEOUT)
+            response = self.session.get(image_url, timeout=self.constants.DEFAULT_TIMEOUT)
             response.raise_for_status()
             
             image = Image.open(BytesIO(response.content))
@@ -163,7 +189,7 @@ class LightNovelScraper:
                 image = image.convert('RGB')
             
             width, height = image.size
-            target_ratio = ScraperConstants.COVER_ASPECT_RATIO
+            target_ratio = self.constants.COVER_ASPECT_RATIO
             current_ratio = width/height
             
             if current_ratio != target_ratio:
@@ -176,8 +202,9 @@ class LightNovelScraper:
                     top = (height - new_height) // 2
                     image = image.crop((0, top, width, top + new_height))
             
-            if height > ScraperConstants.MAX_COVER_HEIGHT:
-                new_height = ScraperConstants.MAX_COVER_HEIGHT
+            width, height = image.size
+            if height > self.constants.MAX_COVER_HEIGHT:
+                new_height = self.constants.MAX_COVER_HEIGHT
                 new_width = int(new_height * target_ratio)
                 image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
             
@@ -250,8 +277,8 @@ class LightNovelScraper:
         in_main_content = True
         
         if self.debug_mode:
-            print("\nRaw content before processing:")
-            print(content_div.prettify())
+            self.logger.debug("\nRaw content before processing:")
+            self.logger.debug(content_div.prettify())
         
         for p in content_div.find_all('p'):
             text = p.text.strip()
@@ -259,48 +286,48 @@ class LightNovelScraper:
                 continue
 
             if self.debug_mode:
-                print(f"\nProcessing paragraph: {text[:100]}...")
+                self.logger.debug(f"\nProcessing paragraph: {text[:100]}...")
 
             # Always add to main content unless it's clearly a note
             if text.startswith('T/L:') or text.startswith('T/N:'):
-                if Config.INCLUDE_CHAPTER_NOTES:
+                if self.config.INCLUDE_CHAPTER_NOTES:
                     after_separator.append(str(p))
                 debug_notes.append(f"Start note: {str(p)}")
                 if self.debug_mode:
-                    print("Found start note")
+                    self.logger.debug("Found start note")
             elif text.startswith(tuple(str(i) + '.' for i in range(1, 10))) and ':' in text:
-                if Config.INCLUDE_FOOTNOTES:
+                if self.config.INCLUDE_FOOTNOTES:
                     footnotes[text.split('.')[0]] = text
                 debug_notes.append(f"Footnote: {text}")
                 if self.debug_mode:
-                    print("Found footnote")
+                    self.logger.debug("Found footnote")
             elif ('T/N:' in text or 'Chapter Note:' in text or 
                 'Thanks for playing' in text or 'As always' in text or
                 self._is_note_or_message(text, p)):
                 found_separator = True
-                if Config.INCLUDE_CHAPTER_NOTES:
+                if self.config.INCLUDE_CHAPTER_NOTES:
                     after_separator.append(str(p))
                 debug_notes.append(f"End note: {str(p)}")
                 if self.debug_mode:
-                    print("Found end note")
+                    self.logger.debug("Found end note")
             else:
                 # Add to main content if it's not obviously a note
                 if not self._is_chapter_number(text):
                     paragraphs.append(str(p))
                     if self.debug_mode:
-                        print("Added to main content")
+                        self.logger.debug("Added to main content")
 
         if self.debug_mode:
-            print(f"\nProcessing results:")
-            print(f"Main paragraphs: {len(paragraphs)}")
-            print(f"After separator: {len(after_separator)}")
-            print(f"Footnotes: {len(footnotes)}")
-            print(f"Debug notes: {len(debug_notes)}")
+            self.logger.debug(f"\nProcessing results:")
+            self.logger.debug(f"Main paragraphs: {len(paragraphs)}")
+            self.logger.debug(f"After separator: {len(after_separator)}")
+            self.logger.debug(f"Footnotes: {len(footnotes)}")
+            self.logger.debug(f"Debug notes: {len(debug_notes)}")
             if len(paragraphs) > 0:
-                print("\nFirst paragraph:")
-                print(paragraphs[0])
-                print("\nLast paragraph:")
-                print(paragraphs[-1])
+                self.logger.debug("\nFirst paragraph:")
+                self.logger.debug(paragraphs[0])
+                self.logger.debug("\nLast paragraph:")
+                self.logger.debug(paragraphs[-1])
 
         return paragraphs, after_separator, footnotes, debug_notes
 
@@ -309,11 +336,11 @@ class LightNovelScraper:
         if not self.validate_url(url):
             raise ValidationError("Invalid chapter URL")
 
-        for attempt in range(ScraperConstants.MAX_RETRIES):
+        for attempt in range(self.constants.MAX_RETRIES):
             try:
                 self.rate_limiter.wait()
                 
-                response = self.session.get(url, timeout=ScraperConstants.DEFAULT_TIMEOUT)
+                response = self.session.get(url, timeout=self.constants.DEFAULT_TIMEOUT)
                 response.raise_for_status()
                 
                 if not response.text.strip():
@@ -322,47 +349,51 @@ class LightNovelScraper:
                 # First parse the full HTML
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                title_elem = soup.find('span', class_='chapter-title')
+                title_elem = soup.select_one(self.constants.TITLE_SELECTOR)
                 chapter_title = self._process_chapter_title(title_elem, url)
                 
                 if not chapter_title:
                     raise ValueError("Chapter title not found")
 
                 # Find the chapter container and process its content
-                content_div = soup.find('div', id='chapter-container')
+                content_div = soup.select_one(self.constants.CONTENT_SELECTOR)
                 if not content_div:
                     raise ValueError("Content container not found")
 
                 if self.debug_mode:
-                    print(f"\nProcessing chapter: {chapter_title}")
-                    print(f"URL: {url}")
+                    self.logger.debug(f"\nProcessing chapter: {chapter_title}")
+                    self.logger.debug(f"URL: {url}")
 
                 paragraphs, after_separator, footnotes, debug_notes = self._process_content(content_div)
 
                 if len(paragraphs) == 0:
                     if self.debug_mode:
-                        print("\nNo paragraphs found in content. Raw content:")
-                        print(content_div.prettify())
+                        self.logger.debug("\nNo paragraphs found in content. Raw content:")
+                        self.logger.debug(content_div.prettify())
                     raise ValueError("No valid content found")
 
                 content = self._format_chapter_content(paragraphs, footnotes)
+                if len(BeautifulSoup(content, 'html.parser').get_text(strip=True)) < self.constants.MIN_CONTENT_LENGTH:
+                    raise ValueError('Chapter content is shorter than the configured minimum length')
                 
                 if self.debug_mode and debug_notes:
-                    print(f"\n{ConsoleColors.RED}Excluded notes for {chapter_title}:")
+                    self.logger.debug(f"\nExcluded notes for {chapter_title}:")
                     for note in debug_notes:
-                        print(f"Note: {note}{ConsoleColors.RESET}")
+                        self.logger.debug(f"Note: {note}")
                 
                 self.rate_limiter.record_success()
                 return chapter_title, content, after_separator, footnotes
 
+            except ScraperCancelled:
+                raise
             except Exception as e:
                 self.logger.error(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
                 if self.debug_mode:
                     import traceback
                     self.logger.error(traceback.format_exc())
                 self.rate_limiter.record_failure()
-                if attempt < ScraperConstants.MAX_RETRIES - 1:
-                    time.sleep((attempt + 1) * 5)
+                if attempt < self.constants.MAX_RETRIES - 1:
+                    self.rate_limiter.sleep((attempt + 1) * 5)
                 else:
                     return None, None, None, None
 
@@ -372,7 +403,7 @@ class LightNovelScraper:
         if not title_elem:
             return None
             
-        if Config.SIMPLE_CHAPTER_NAMES:
+        if self.config.SIMPLE_CHAPTER_NAMES:
             url_match = re.search(r'chapter-(\d+)', url)
             return f"Chapter {url_match.group(1)}" if url_match else title_elem.text.strip()
         return title_elem.text.strip()
@@ -380,11 +411,12 @@ class LightNovelScraper:
     def _format_chapter_content(self, paragraphs: List[str], footnotes: Dict[str, str]) -> str:
         processed_paragraphs = []
         for p in paragraphs:
-            if Config.INCLUDE_FOOTNOTES:
+            if self.config.INCLUDE_FOOTNOTES:
                 soup_p = BeautifulSoup(p, 'html.parser')
                 for sup in soup_p.find_all('sup'):
                     ref_num = sup.text.strip()
                     if ref_num in footnotes:
+                        sup['id'] = f'ref-{ref_num}'
                         sup.wrap(soup_p.new_tag('a', href=f'#footnote-{ref_num}'))
                 processed_paragraphs.append(str(soup_p))
             else:
@@ -395,7 +427,9 @@ class LightNovelScraper:
 
 class EpubCreator:
     def __init__(self, novel_title: str, author: str = "Unknown", 
-                    translator: str = "", created_by: str = "LightNovelScraper"):
+                    translator: str = "", created_by: str = "WebNovelScraper", settings=None, language: str = "en"):
+        self.config = settings if settings is not None else Config
+        self.language = language
         self.novel_title = novel_title
         self.author = author
         self.translator = translator
@@ -406,13 +440,13 @@ class EpubCreator:
     def _initialize_book(self) -> None:
         self.book.set_identifier(f'id_{self.novel_title.lower().replace(" ", "_")}')
         self.book.set_title(self.novel_title)
-        self.book.set_language('en')
+        self.book.set_language(self.language)
         
         if self.author and self.author != "Unknown":
             self.book.add_author(self.author)
         if self.translator:
             self.book.add_metadata('DC', 'contributor', self.translator, {'role': 'trl'})
-        if self.created_by != "LightNovelScraper":
+        if self.created_by and self.created_by != "WebNovelScraper":
             self.book.add_metadata('DC', 'publisher', self.created_by)
 
     def add_cover(self, cover_data: Tuple[bytes, str, str]) -> None:
@@ -423,19 +457,19 @@ class EpubCreator:
         chapter = epub.EpubHtml(
             title=chapter_data['title'],
             file_name=f'chap_{index:03d}.xhtml',
-            lang='en'
+            lang=self.language
         )
         
         chapter_content = [
-            f'<h1>{chapter_data["title"]}</h1>',
+            f'<h1>{escape(chapter_data["title"])}</h1>',
             '<div class="chapter-content">',
             chapter_data['content']
         ]
 
-        if Config.INCLUDE_FOOTNOTES and chapter_data['footnotes']:
+        if self.config.INCLUDE_FOOTNOTES and chapter_data['footnotes']:
             chapter_content.extend(self._format_footnotes(chapter_data['footnotes']))
             
-        if Config.INCLUDE_CHAPTER_NOTES and chapter_data['notes']:
+        if self.config.INCLUDE_CHAPTER_NOTES and chapter_data['notes']:
             chapter_content.extend(self._format_chapter_notes(chapter_data['notes']))
             
         chapter_content.append('</div>')
@@ -467,6 +501,8 @@ class EpubCreator:
     def finalize(self, chapters: List[epub.EpubHtml]) -> None:
         self._add_navigation(chapters)
         self._add_styling()
+        for chapter in chapters:
+            chapter.add_link(href='style/nav.css', rel='stylesheet', type='text/css')
         self.book.spine = ['nav'] + chapters
 
     def _add_navigation(self, chapters: List[epub.EpubHtml]) -> None:
@@ -530,7 +566,7 @@ class EpubCreator:
         self.book.add_item(nav_css)
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Light Novel Scraper')
+    parser = argparse.ArgumentParser(description='Web Novel Scraper')
     
     required = parser.add_argument_group('required arguments')
     required.add_argument('--url', type=str, help='Base URL')
@@ -567,7 +603,7 @@ def get_optional_input(prompt: str, arg_value: Optional[str] = None, default: st
 
 def get_user_input(args: argparse.Namespace) -> Dict[str, str]:
     inputs = {}
-    print("\nLight Novel Scraper")
+    print("\nWeb Novel Scraper")
     print("==================")
 
     inputs['base_url'] = args.url if args.url else input("\nEnter base URL: ").strip()
@@ -633,9 +669,9 @@ def get_user_input(args: argparse.Namespace) -> Dict[str, str]:
 
         if args.creator is None:
             if get_yes_no_input("Change creator name?"):
-                inputs['created_by'] = get_optional_input("Creator name", default="LightNovelScraper")
+                inputs['created_by'] = get_optional_input("Creator name", default="WebNovelScraper")
             else:
-                inputs['created_by'] = "LightNovelScraper"
+                inputs['created_by'] = "WebNovelScraper"
         else:
             inputs['created_by'] = args.creator
 
@@ -674,14 +710,14 @@ def main() -> None:
             print(f"Author: {inputs['author']}")
         if inputs['translator']:
             print(f"Translator: {inputs['translator']}")
-        if inputs['created_by'] != "LightNovelScraper":
+        if inputs['created_by'] != "WebNovelScraper":
             print(f"Creator: {inputs['created_by']}")
 
         if not get_yes_no_input("\nProceed with these settings?", default=True):
             print("Aborted by user.")
             return
 
-        scraper = LightNovelScraper(debug_mode=Config.DEBUG_MODE)
+        scraper = WebNovelScraper(debug_mode=Config.DEBUG_MODE)
         progress = ProgressTracker(inputs['end_chapter'] - inputs['start_chapter'] + 1)
         
         chapters_data = []

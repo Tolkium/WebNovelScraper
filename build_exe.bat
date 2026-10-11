@@ -1,35 +1,21 @@
 @echo off
-echo Building LightNovelScraper executable...
-echo.
-
-echo Checking if executable exists and closing it...
-taskkill /F /IM LightNovelScraper.exe 2>NUL
-
-echo Checking if PyInstaller is installed...
-python -c "import PyInstaller" 2>NUL
-if %errorlevel% neq 0 (
-    echo PyInstaller is not installed. Installing it now...
-    pip install pyinstaller
+setlocal
+cd /d "%~dp0"
+echo Building WebNovelScraper executable...
+if not exist "webnovel_env\Scripts\python.exe" (
+    python -m venv webnovel_env
+    if errorlevel 1 goto build_error
 )
-
-echo Clearing previous builds...
-if exist "dist" rmdir /s /q "dist"
-if exist "build" rmdir /s /q "build"
-
-echo Installing requirements...
-pip install -r requirements.txt
-
-echo.
-echo Creating executable...
-pyinstaller --clean LightNovelScraper.spec
-
-if %errorlevel% equ 0 (
-    echo.
-    echo Build successful! Executable is in the dist folder.
-    echo Testing icon presence...
-    powershell -Command "& {$icon = [System.Drawing.Icon]::ExtractAssociatedIcon('dist\LightNovelScraper.exe'); if ($icon) { echo 'Icon is present in the executable.' } else { echo 'Icon is missing from the executable.' }}"
-) else (
-    echo.
-    echo Build failed or executable not found!
-)
+"webnovel_env\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
+if errorlevel 1 goto build_error
+set "PYINSTALLER_CONFIG_DIR=%CD%\build\pyinstaller-cache"
+"webnovel_env\Scripts\python.exe" -m PyInstaller --clean --noconfirm WebNovelScraper.spec
+if errorlevel 1 goto build_error
+echo Build successful! Open dist\WebNovelScraper.exe to start the desktop app.
 pause
+exit /b 0
+
+:build_error
+echo Build failed. See the error above.
+pause
+exit /b 1

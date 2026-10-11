@@ -27,7 +27,7 @@ wheels/
 venv/
 ENV/
 env/
-lightnovel_env/
+webnovel_env/
 
 # IDE
 .idea/
