@@ -1,19 +1,19 @@
-# Light Novel Scraper
+# Web Novel Scraper
 
-A powerful tool to extract and convert light novels into EPUB format with support for footnotes, chapter notes, cover images, and more.
+An accessibility tool to help an individual blind person convert web novels into EPUB files for reading with text-to-speech (TTS) software, with support for footnotes, chapter notes, cover images, and more.
 
 ## Important Note
 
-**Current Compatibility**: This tool has been specifically developed and tested for a certain popular light novel website that rhymes with "novel full" 😉. While it works flawlessly there, using it elsewhere will require modifications to the content selection logic.
+**Current Compatibility**: This tool has been specifically developed and tested for one certain website where "lite" reading material exists in this "novel world" of ours 😉. While it works flawlessly there, using it elsewhere will in most cases require modifications to the content selection logic.
 
 **Need help?** You have options:
 
 1. Modify the content selectors yourself using the code comments below
 2. Open an issue on GitHub - if I have time between reading chapters 📚, I might help adapt it
 
-### For Developers
+## For Developers
 
-If you want to adapt this for a different site, you'll need to modify these parts in `LightNovelScraper.py`:
+If you want to adapt this for a different site, you'll need to modify these parts in `WebNovelScraper.py`:
 
 ```python
 # 1. Content targeting (required) - in get_chapter_content():
@@ -35,21 +35,18 @@ If you want to adapt this for a different site, you'll need to modify these part
 **Debug/Modify:**
 
 ```bash
-python LightNovelScraper.py --debug  # See all processing details
+python WebNovelScraper.py --debug  # See all processing details
 ```
 
-Edit `_clean_html_content()` to modify content cleaning or `_process_content()` to change how special content (notes, footnotes) is handled.
+## Intended Purpose
 
-**Please Note**: This is a hobby project created for legitimate use cases, such as:
+The sole purpose of this app is to help an individual blind person create EPUB files and read them using text-to-speech (TTS) software. It is intended exclusively for this personal accessibility purpose and is not meant to be used for any other purpose.
 
-- Using advanced Text-to-Speech solutions for personal audio enjoyment
-- Reading offline during your commute
-
-This is NOT a tool for commercial purposes or content redistribution. <span style="color: red; font-size: 1.2em">**Support the original content creators**</span> by visiting their sites and, if possible, purchasing official releases. Think of this as a personal format converter for your offline reading convenience.
+Commercial use and content redistribution are outside this intended purpose. **Support the original content creators** by visiting their sites and, if possible, purchasing official releases.
 
 ## Features
 
-- Downloads and converts light novels to EPUB format
+- Downloads and converts web novels to EPUB format
 - Customizable metadata (author, translator, creator)
 - Cover image support with automatic resizing and optimization
 - Footnotes support with proper linking
@@ -61,12 +58,17 @@ This is NOT a tool for commercial purposes or content redistribution. <span styl
 - Rate limiting to prevent server overload
 - Debug logging
 - Cross-platform support (Windows, Linux, Mac)
+- Native desktop interface with six organized sections
+- Background EPUB creation, chapter results, cancellation and downloadable logs
+- Saved project settings and automatic draft restoration
+- Recent EPUB library, chapter text preview and reading with installed TTS voices
 - Command-line interface with both interactive and argument modes
 
 ## Requirements
 
-- Python 3.7 or higher
+- Python 3.10 or higher
 - pip (Python package installer)
+- For built-in read-aloud: a system TTS engine and installed voices
 
 ## Installation
 
@@ -75,32 +77,74 @@ This is NOT a tool for commercial purposes or content redistribution. <span styl
 3. Run the installation script:
 
 For Windows users:
+
 ```bash
 run.bat
 ```
 
 For Linux/Mac users:
+
 ```bash
 chmod +x run.sh
 ./run.sh
 ```
 
+The launch scripts create a local `webnovel_env` environment, install the dependencies there, and open the desktop app. Use the launch script each time to run with these dependencies. The first launch requires an internet connection to install dependencies.
+
 ## Usage
 
-The script can be run in two modes:
+### Desktop workspace
+
+Run `run.bat` on Windows or `./run.sh` on Linux/Mac. After building the standalone executable, you can also open `dist/WebNovelScraper.exe` on Windows without installing Python.
+
+The sidebar separates the workflow into six sections:
+
+| Section | What you can do |
+| --- | --- |
+| **Novel setup** | Paste a full novel or chapter URL to fill the source, enter a title, choose the chapter range, and select the output folder and filename. |
+| **EPUB options** | Include or exclude footnotes and translator/chapter notes, and choose original or simple chapter headings. |
+| **Book details** | Set author, translator, creator/publisher, EPUB language, and an optional cover image URL. |
+| **Advanced** | Set request rate, timeout, retry attempts, user agent, title/content CSS selectors, minimum chapter length, cover size/ratio, and detailed debug logging. |
+| **Activity** | Track chapter progress, inspect downloaded and failed chapters, save the activity log, and open or preview the finished EPUB. |
+| **Library & reader** | Open existing EPUBs, revisit recent books, preview chapter text, change text size, and read aloud using installed system voices. |
+
+Click **Review and create EPUB** to check the settings before starting. EPUB creation runs in the background, so the window stays responsive. Existing EPUBs require confirmation before replacement; they are replaced only after the new book is complete. If some chapters fail, the EPUB contains the successful chapters and Activity lists the missing chapter numbers. If every chapter fails, no EPUB is created.
+
+**Cancel job** stops between requests and interrupts retry waits. An active network request must finish or time out before cancellation completes. Cancelling leaves existing EPUBs unchanged and does not save a partial book.
+
+Use **File → Save settings** and **File → Load settings** to reuse a project. The app also remembers the current draft, window size, reader text size, and recent books on exit. Diagnostic logs are stored under the app's local data folder; each job shows its full log path in Activity. Detailed debug logs can contain chapter text and source URLs.
+
+The reader shows plain chapter text in EPUB reading order. **Read aloud** uses installed system voices; it reads the selected chapter. **Pause/Resume** is available when the selected TTS engine supports it. You can also open the EPUB in your preferred reading app. TTS availability depends on your operating system and installed speech engines/voices; on Linux this may require installing a supported speech engine separately.
+
+Changing CSS selectors can adapt basic content targeting to another website, but site-specific cleaning rules may still require code changes.
+
+### Command-line interface
+
+The original command-line interface remains available using the local environment:
+
+```powershell
+.\webnovel_env\Scripts\python.exe WebNovelScraper.py
+# Or use the launcher:
+.\run.bat --cli
+```
+
+On Linux/Mac, use `webnovel_env/bin/python WebNovelScraper.py` or `./run.sh --cli`. The examples below assume you have activated this environment.
 
 Interactive Mode:
+
 ```bash
-python LightNovelScraper.py
+python WebNovelScraper.py
 ```
 
 Command-line Mode:
+
 ```bash
-python LightNovelScraper.py [options]
+python WebNovelScraper.py [options]
 ```
 
 Command-line Options:
-- `--url`: Base URL for the light novel website
+
+- `--url`: Base URL for the web novel website
 - `--novel-id`: Novel ID from the URL
 - `--start`: First chapter number to download
 - `--end`: Last chapter number to download
@@ -115,8 +159,9 @@ Command-line Options:
 - `--include-notes`: Include chapter notes in output
 
 Example:
+
 ```bash
-python LightNovelScraper.py --url "https://example.com/novel/" --novel-id "novel-name-123" --start 1 --end 10 --title "My Novel" --cover-url "https://example.com/cover.jpg" --author "Author Name" --simple-chapters
+python WebNovelScraper.py --url "https://example.com/novel/" --novel-id "novel-name-123" --start 1 --end 10 --title "My Novel" --cover-url "https://example.com/cover.jpg" --author "Author Name" --simple-chapters
 ```
 
 ## Building Executable
@@ -124,11 +169,13 @@ python LightNovelScraper.py --url "https://example.com/novel/" --novel-id "novel
 To create a standalone executable:
 
 For Windows:
+
 ```bash
 build_exe.bat
 ```
 
 For Linux/Mac:
+
 ```bash
 chmod +x build_exe.sh
 ./build_exe.sh
@@ -138,17 +185,25 @@ chmod +x build_exe.sh
 
 ```
 project/
-├── LightNovelScraper.py     # Main script
-├── requirements.txt         # Python dependencies
-├── setup.py                # Package setup file
-├── build_exe.bat          # Windows build script
-├── build_exe.sh           # Linux/Mac build script
-├── run.bat                # Windows run script
-├── run.sh                 # Linux/Mac run script
-├── LightNovelScraper.spec # PyInstaller spec file
-└── README.md              # Documentation
-├── build/                 # Build output directory
-└── dist/                  # Distribution output directory
+  ├── WebNovelDesktop.py            # Desktop interface
+  ├── desktop_service.py            # Background jobs and EPUB reading
+  ├── WebNovelScraper.py            # Scraper engine and original CLI
+  ├── WebNovelScraper_Simple.py     # Simplified version of scraper
+  ├── requirements.txt              # Python dependencies
+  ├── setup.py                      # Package setup file
+  ├── build_exe.bat                 # Windows executable build script
+  ├── build_exe.sh                  # Linux/Mac executable build script
+  ├── build.bat                     # Windows build script
+  ├── build.sh                      # Linux/Mac build script
+  ├── run.bat                       # Windows run script
+  ├── run.sh                        # Linux/Mac run script
+  ├── icon.ico                      # Application icon
+  ├── WebNovelScraper.spec          # Desktop executable build configuration
+  ├── tests/                       # Local website and desktop integration tests
+  ├── README.md                     # Documentation
+  ├── .gitignore                    # Git ignore file
+  ├── build/                        # Build output directory
+  └── dist/                         # Distribution output directory
 ```
 
 ## Advanced Features
@@ -159,6 +214,12 @@ project/
 - **Progress Tracking**: Real-time progress display with success/failure counts
 - **Error Recovery**: Automatic retry mechanism for failed downloads
 - **Debug Logging**: Detailed logging for troubleshooting
+
+## Development checks
+
+On Windows, run `.\webnovel_env\Scripts\python.exe -m unittest discover -s tests -v`. On Linux/Mac, use `webnovel_env/bin/python -m unittest discover -s tests -v`.
+
+The tests use a local fixture website to verify the complete desktop job through chapter fetching, content options, cover processing, EPUB writing, preview, progress, saved settings, cancellation and failure handling. They do not download novels from external websites.
 
 ## Troubleshooting
 
@@ -177,13 +238,6 @@ If you encounter issues:
 
 - **Architecture**
   - Project code modularization
-
-- **Basic GUI**
-  - Simple application interface
-  - Progress visualization
-
-- **Content Targeting**
-  - Configurable content selectors (CSS/class/ID)
 
 - **Content Processing**
   - Better content cleaning
@@ -209,4 +263,4 @@ Note: This roadmap reflects an honest assessment of future development possibili
 
 ## License
 
-This project is for educational purposes only. Use responsibly and in accordance with the terms of service of the target websites.
+This project is intended solely for the personal accessibility purpose described above. Use responsibly and in accordance with the terms of service of the target websites.
