@@ -81,6 +81,7 @@ QProgressBar { border: none; border-radius: 4px; background: #e3e9ee; min-height
 QProgressBar::chunk { background: #408b95; border-radius: 4px; }
 QPlainTextEdit, QTableWidget, QListWidget#chapters, QListWidget#library { background: white; border: 1px solid #dce3e9; border-radius: 8px; padding: 8px; selection-background-color: #deedef; selection-color: #244c52; }
 QTableWidget { padding: 0; gridline-color: #eef2f5; }
+QTableWidget::item { padding: 0 12px; }
 QPlainTextEdit#log { font-family: 'Cascadia Mono', 'Consolas', monospace; font-size: 12px; }
 QHeaderView::section { background: #eef2f5; border: none; border-bottom: 1px solid #dce3e9; padding: 8px 12px; color: #3d5060; font-weight: 600; }
 QFrame#footer { border-top: 1px solid #c9d8db; background: #e6eff0; }

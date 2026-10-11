@@ -2,6 +2,11 @@
 
 An accessibility tool to help an individual blind person convert web novels into EPUB files for reading with text-to-speech (TTS) software, with support for footnotes, chapter notes, cover images, and more.
 
+<p align="center">
+  <img src="docs/screenshots/novel-setup.png" alt="Novel setup: paste a novel URL, pick the chapter range and output folder" width="49%">
+  <img src="docs/screenshots/activity.png" alt="Activity: live download stats, per-chapter results and the job log" width="49%">
+</p>
+
 ## Important Note
 
 **Current Compatibility**: This tool has been specifically developed and tested for one certain website where "lite" reading material exists in this "novel world" of ours 😉. While it works flawlessly there, using it elsewhere will in most cases require modifications to the content selection logic.
@@ -200,6 +205,7 @@ project/
   ├── icon.ico                      # Application icon
   ├── WebNovelScraper.spec          # Desktop executable build configuration
   ├── tests/                       # Local website and desktop integration tests
+  ├── docs/screenshots/             # README screenshots
   ├── README.md                     # Documentation
   ├── .gitignore                    # Git ignore file
   ├── build/                        # Build output directory
