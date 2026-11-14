@@ -42,6 +42,7 @@ class Config:
     INCLUDE_FOOTNOTES: bool = False
     INCLUDE_CHAPTER_NOTES: bool = False
     SIMPLE_CHAPTER_NAMES: bool = False
+    CHAPTER_HEADINGS: bool = True
     DEBUG_MODE: bool = False
 
     @classmethod
@@ -328,6 +329,9 @@ class WebNovelScraper:
             else:
                 # Add to main content if it's not obviously a note
                 if not self._is_chapter_number(text):
+                    first = p.find(string=True)
+                    if first is not None and first[:1].isspace():
+                        first.replace_with(first.lstrip())
                     paragraphs.append(str(p))
                     if self.debug_mode:
                         self.logger.debug("Added to main content")
@@ -491,11 +495,9 @@ class EpubCreator:
             lang=self.language
         )
         
-        chapter_content = [
-            f'<h1>{escape(chapter_data["title"])}</h1>',
-            '<div class="chapter-content">',
-            chapter_data['content']
-        ]
+        # Without the heading, text-to-speech goes straight into the story; the title stays in the contents.
+        chapter_content = [f'<h1>{escape(chapter_data["title"])}</h1>'] if self.config.CHAPTER_HEADINGS else []
+        chapter_content += ['<div class="chapter-content">', chapter_data['content']]
 
         if self.config.INCLUDE_FOOTNOTES and chapter_data['footnotes']:
             chapter_content.extend(self._format_footnotes(chapter_data['footnotes']))
@@ -555,7 +557,7 @@ class EpubCreator:
             }
             h2 { margin-top: 2em; }
             h3 { margin-top: 1.5em; }
-            p { margin: 1em 0; }
+            p { margin: 1em 0; text-indent: 0; }
             .chapter-content {
                 line-height: 1.6;
             }
@@ -649,6 +651,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--simple-chapters', action='store_true', help='Use simple chapter numbering')
     parser.add_argument('--include-footnotes', action='store_true', help='Include footnotes')
     parser.add_argument('--include-notes', action='store_true', help='Include chapter notes')
+    parser.add_argument('--no-headings', action='store_true',
+                        help='Leave chapter headings out of the text so text-to-speech does not read them')
 
     return parser.parse_args()
 
@@ -745,15 +749,17 @@ def get_user_input(args: argparse.Namespace) -> Dict[str, str]:
         else:
             inputs['created_by'] = args.creator
 
-    if not any([args.simple_chapters, args.include_footnotes, args.include_notes]):
+    if not any([args.simple_chapters, args.include_footnotes, args.include_notes, args.no_headings]):
         print("\nConfiguration options:")
         Config.SIMPLE_CHAPTER_NAMES = get_yes_no_input("Use simple chapter numbering?")
         Config.INCLUDE_FOOTNOTES = get_yes_no_input("Include footnotes?")
         Config.INCLUDE_CHAPTER_NOTES = get_yes_no_input("Include chapter notes?")
+        Config.CHAPTER_HEADINGS = get_yes_no_input("Read chapter headings aloud?", default=True)
     else:
         Config.SIMPLE_CHAPTER_NAMES = args.simple_chapters
         Config.INCLUDE_FOOTNOTES = args.include_footnotes
         Config.INCLUDE_CHAPTER_NOTES = args.include_notes
+        Config.CHAPTER_HEADINGS = not args.no_headings
 
     return inputs
 
@@ -778,6 +784,7 @@ def main() -> None:
         print(f"Simple Chapter Names: {'On' if Config.SIMPLE_CHAPTER_NAMES else 'Off'}")
         print(f"Include Footnotes: {'On' if Config.INCLUDE_FOOTNOTES else 'Off'}")
         print(f"Include Chapter Notes: {'On' if Config.INCLUDE_CHAPTER_NOTES else 'Off'}")
+        print(f"Chapter Headings: {'On' if Config.CHAPTER_HEADINGS else 'Off'}")
         
         if inputs['cover_url']:
             print(f"Cover URL: {inputs['cover_url']}")

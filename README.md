@@ -107,7 +107,7 @@ The sidebar separates the workflow into six sections:
 | Section | What you can do |
 | --- | --- |
 | **Novel setup** | Paste a full novel or chapter URL to fill the source, enter a title, choose the chapter range, and select the output folder and filename. |
-| **EPUB options** | Include or exclude footnotes and translator/chapter notes, and choose original or simple chapter headings. |
+| **EPUB options** | Include or exclude footnotes and translator/chapter notes, and choose original or simple chapter headings, or leave headings out of the text so text-to-speech does not read them. |
 | **Book details** | Set author, translator, creator/publisher, EPUB language, and an optional cover image URL. |
 | **Advanced** | Set request rate, timeout, retry attempts, user agent, title/content CSS selectors, minimum chapter length, cover size/ratio, and detailed debug logging. |
 | **Activity** | Track chapter progress, inspect downloaded and failed chapters, save the activity log, and open or preview the finished EPUB. |
@@ -160,6 +160,7 @@ Command-line Options:
 - `--translator`: Translator name
 - `--creator`: Creator name
 - `--simple-chapters`: Use simple chapter numbering
+- `--no-headings`: Leave chapter headings out of the text so text-to-speech goes straight into the story (chapter names stay in the table of contents)
 - `--include-footnotes`: Include footnotes in output
 - `--include-notes`: Include chapter notes in output
 - `--chapter-prefix`: Text before the chapter number in chapter URLs (default `chapter-`)

@@ -40,6 +40,7 @@ class JobSettings:
     language: str = 'en'
     cover_url: str = ''
     simple_chapters: bool = False
+    chapter_headings: bool = True
     include_footnotes: bool = False
     include_notes: bool = False
     debug: bool = False
@@ -132,6 +133,7 @@ class JobSettings:
             INCLUDE_FOOTNOTES=self.include_footnotes,
             INCLUDE_CHAPTER_NOTES=self.include_notes,
             SIMPLE_CHAPTER_NAMES=self.simple_chapters,
+            CHAPTER_HEADINGS=self.chapter_headings,
             DEBUG_MODE=self.debug,
         )
 
@@ -356,11 +358,12 @@ def read_epub(path):
         if (item is None or item.get_type() != ITEM_DOCUMENT or not item.is_chapter()
                 or 'nav' in getattr(item, 'properties', [])):
             continue
-        soup = BeautifulSoup(item.get_content(), 'html.parser')
+        # The stored file, because get_content() rebuilds it without the <title> used when there is no heading.
+        soup = BeautifulSoup(item.content, 'html.parser')
         for unwanted in soup.select('script, style'):
             unwanted.decompose()
-        heading = soup.find(['h1', 'h2', 'h3'])
-        name = heading.get_text(' ', strip=True) if heading else item.get_name()
+        heading = soup.find(['h1', 'h2', 'h3']) or soup.title
+        name = heading.get_text(' ', strip=True) if heading and heading.get_text(strip=True) else item.get_name()
         body = soup.body or soup
         text = body.get_text('\n', strip=True)
         if text:

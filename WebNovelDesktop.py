@@ -538,6 +538,9 @@ class DesktopWindow(QMainWindow):
         naming = self._card(layout, 'Chapter headings')
         self._check(naming, 'simple_chapters', 'Use simple chapter names',
                     'Use “Chapter 1”, “Chapter 2”, and so on, following the source chapter number. Otherwise keep original chapter titles.')
+        self._check(naming, 'chapter_headings', 'Read chapter headings aloud',
+                    'Start each chapter with its heading. Turn this off so text-to-speech goes straight into the story; '
+                    'chapter names stay in the table of contents.')
         expectations = self._card(layout, 'Reading-ready EPUBs')
         expectations.addWidget(self._hint('Every book includes a table of contents, chapter navigation and reading styles. '
                                          'The existing content cleaner removes recognized advertisements, scripts and repeated chapter numbers. '

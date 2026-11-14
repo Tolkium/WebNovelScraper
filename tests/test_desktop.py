@@ -326,6 +326,16 @@ class DesktopTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_chapter_headings_checkbox_is_on_by_default(self):
+        window = self.window()
+        try:
+            checkbox = window.controls['chapter_headings']
+            self.assertTrue(checkbox.isChecked())
+            checkbox.setChecked(False)
+            self.assertFalse(window._collect_settings().chapter_headings)
+        finally:
+            window.close()
+
     def test_cli_chapter_prefix_argument(self):
         with patch('sys.argv', ['WebNovelScraper.py']):
             self.assertEqual(parse_arguments().chapter_prefix, 'chapter-')

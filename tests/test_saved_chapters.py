@@ -80,6 +80,13 @@ class SavedChapterTests(unittest.TestCase):
         for unwanted in ('Glossary', 'Current schedule', 'Patreon', '<p>Chapter 105</p>'):
             self.assertNotIn(unwanted, content)
 
+    def test_paragraphs_do_not_start_with_spaces(self):
+        story = '<p> \n “A skill that permanently improves the <em>performance</em>.”' + ' More story.' * 20 + '</p>'
+        (self.folder / 'novel.html').write_text(saved_file((98, story)), encoding='utf-8')
+        [(number, section)] = read_saved_chapters(self.folder)
+        content = WebNovelScraper(log_path=self.folder / 'test.log').parse_saved_chapter(section, number)[1]
+        self.assertIn('<p>“A skill that permanently improves the <em>performance</em>.”', content)
+
     def test_empty_saved_chapter_fails_without_stopping(self):
         (self.folder / 'novel.html').write_text(saved_file((7, '')), encoding='utf-8')
         [(number, section)] = read_saved_chapters(self.folder)
@@ -98,6 +105,17 @@ class SavedChapterTests(unittest.TestCase):
         self.assertEqual((result.success, result.failed), (2, []))
         self.assertEqual([title for title, _ in read_epub(result.path)[1]], ['Chapter 2', 'Chapter 3'])
 
+    def test_headings_can_be_left_out_of_the_chapter_text(self):
+        (self.folder / 'novel.html').write_text(saved_file((1, STORY), (2, STORY), (3, STORY)), encoding='utf-8')
+        result = self.saved_job(chapter_headings=False)
+        with ZipFile(result.path) as archive:
+            chapter = archive.read('EPUB/chap_001.xhtml').decode()
+            self.assertNotIn('<h1', chapter)
+            self.assertIn('Chapter 2', archive.read('EPUB/nav.xhtml').decode())
+        title, text = read_epub(result.path)[1][0]
+        self.assertEqual(title, 'Chapter 2')
+        self.assertTrue(text.startswith('The shield'))
+
     def test_saved_file_must_exist_and_hold_the_chosen_chapters(self):
         settings = JobSettings(title='Saved Book', output_dir=str(self.folder), saved_file=str(self.folder / 'missing.html'))
         self.assertIn('saved_file', settings.validate())
@@ -105,22 +123,32 @@ class SavedChapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'No saved chapters 2 to 3'):
             self.saved_job()
 
-    def test_cli_builds_epub_from_folder_and_chapter_range(self):
+    def run_cli(self, *options):
         (self.folder / 'novel.html').write_text(saved_file((1, STORY), (2, STORY), (3, STORY)), encoding='utf-8')
         argv = ['WebNovelScraper.py', '--from-folder', str(self.folder), '--title', 'Saved Book',
-                '--start', '2', '--end', '3', '--simple-chapters']
+                '--start', '2', '--end', '3', *options]
         previous = os.getcwd()
         os.chdir(self.folder)
         try:
-            with patch('sys.argv', argv), patch('builtins.input', return_value=''):
+            with patch('sys.argv', argv), patch('builtins.input', return_value=''), \
+                    patch.object(Config, 'CHAPTER_HEADINGS', Config.CHAPTER_HEADINGS):
                 main()
         finally:
             os.chdir(previous)
-        with ZipFile(self.folder / 'saved_book.epub') as archive:
+        return ZipFile(self.folder / 'saved_book.epub')
+
+    def test_cli_no_headings_leaves_titles_out_of_the_text(self):
+        with self.run_cli('--simple-chapters', '--no-headings') as archive:
+            self.assertNotIn('<h1', archive.read('EPUB/chap_001.xhtml').decode())
+            self.assertIn('Chapter 2', archive.read('EPUB/nav.xhtml').decode())
+
+    def test_cli_builds_epub_from_folder_and_chapter_range(self):
+        with self.run_cli('--simple-chapters') as archive:
             chapters = sorted(name for name in archive.namelist() if name.startswith('EPUB/chap_'))
             self.assertEqual(len(chapters), 2)
             self.assertIn('Chapter 2', archive.read(chapters[0]).decode())
             self.assertIn('shield', archive.read(chapters[1]).decode())
+            self.assertIn('text-indent: 0', archive.read('EPUB/style/nav.css').decode())
 
 
 if __name__ == '__main__':
