@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtTextToSpeech import QTextToSpeech
 
-from desktop_service import JobSettings, read_epub, run_job, split_novel_url
+from desktop_service import JobSettings, read_epub, run_job, site_selectors, split_novel_url
 
 
 STYLE = """
@@ -461,6 +461,8 @@ class DesktopWindow(QMainWindow):
         form = self._form(source)
         self._field(form, 'base_url', 'Website base URL', placeholder='https://website.example/novel/')
         self._field(form, 'novel_id', 'Novel ID', placeholder='your-novel-id')
+        self._field(form, 'chapter_prefix', 'Chapter link prefix', placeholder='chapter-',
+                    hint='The text before the chapter number in chapter links, such as chapter- or og-chapter-.')
         self._field(form, 'title', 'Book title', placeholder='The title that appears in your EPUB')
 
         range_box = self._card(layout, '2. Choose chapters', 'Both the first and last chapter are included.')
@@ -846,13 +848,19 @@ class DesktopWindow(QMainWindow):
         self.preferences.sync()
 
     def _use_url(self):
+        url = self.novel_url.text().strip()
         try:
-            base, novel = split_novel_url(self.novel_url.text())
+            base, novel, prefix = split_novel_url(url)
         except ValueError as error:
             QMessageBox.warning(self, 'Check the novel URL', str(error))
             return
         self.controls['base_url'].setText(base)
         self.controls['novel_id'].setText(novel)
+        self.controls['chapter_prefix'].setText(prefix)
+        title_selector, content_selector = (site_selectors(url)
+                                            or (JobSettings.title_selector, JobSettings.content_selector))
+        self.controls['title_selector'].setText(title_selector)
+        self.controls['content_selector'].setText(content_selector)
         self.statusBar().showMessage('Source filled in. Add your book title and chapter range.')
 
     def _choose_folder(self):

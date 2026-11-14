@@ -225,10 +225,10 @@ class WebNovelScraper:
         # Parse cleaned content back to BeautifulSoup
         content_div = BeautifulSoup(content_str, 'html.parser')
         
-        # Remove specific ad-related elements
+        # Remove specific ad-related elements, plus page controls hidden from screen readers
         for selector in [
-            'script', '.CTGIiSmv', '.L-MHncuP', '.vm-placement', 
-            'div[data-defid]', 'div[data-mobid]'
+            'script', '.CTGIiSmv', '.L-MHncuP', '.vm-placement',
+            'div[data-defid]', 'div[data-mobid]', '[aria-hidden="true"]:has(button)'
         ]:
             for element in content_div.select(selector):
                 element.decompose()
@@ -404,7 +404,7 @@ class WebNovelScraper:
             return None
             
         if self.config.SIMPLE_CHAPTER_NAMES:
-            url_match = re.search(r'chapter-(\d+)', url)
+            url_match = re.search(r'(\d+)/?$', urlparse(url).path)
             return f"Chapter {url_match.group(1)}" if url_match else title_elem.text.strip()
         return title_elem.text.strip()
 
@@ -574,6 +574,8 @@ def parse_arguments() -> argparse.Namespace:
     required.add_argument('--start', type=int, help='Start chapter')
     required.add_argument('--end', type=int, help='End chapter')
     required.add_argument('--title', type=str, help='Novel title')
+    parser.add_argument('--chapter-prefix', type=str, default='chapter-',
+                        help='Text before the chapter number in chapter URLs (default: chapter-)')
     
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--cover-url', type=str, help='Cover image URL')
@@ -736,7 +738,7 @@ def main() -> None:
                 print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process cover image{ConsoleColors.RESET}")
 
         for chapter_num in range(inputs['start_chapter'], inputs['end_chapter'] + 1):
-            url = f"{inputs['base_url']}{inputs['novel_id']}/chapter-{chapter_num}"
+            url = f"{inputs['base_url']}{inputs['novel_id']}/{args.chapter_prefix}{chapter_num}"
             
             chapter_title, content, notes, footnotes = scraper.get_chapter_content(url)
             

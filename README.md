@@ -162,6 +162,7 @@ Command-line Options:
 - `--simple-chapters`: Use simple chapter numbering
 - `--include-footnotes`: Include footnotes in output
 - `--include-notes`: Include chapter notes in output
+- `--chapter-prefix`: Text before the chapter number in chapter URLs (default `chapter-`)
 
 Example:
 

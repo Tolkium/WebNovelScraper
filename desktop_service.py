@@ -23,6 +23,7 @@ from WebNovelScraper import (
 class JobSettings:
     base_url: str = ''
     novel_id: str = ''
+    chapter_prefix: str = 'chapter-'
     title: str = ''
     start: int = 1
     end: int = 10
@@ -81,6 +82,8 @@ class JobSettings:
             errors['base_url'] = 'Enter a full website base URL beginning with https:// or http://.'
         if not self.novel_id.strip() or re.search(r'[/\\?#\s]', self.novel_id):
             errors['novel_id'] = 'Enter the novel ID from the URL, without slashes, spaces or query parameters.'
+        if not re.fullmatch(r'[\w.-]*', self.chapter_prefix):
+            errors['chapter_prefix'] = 'Enter the chapter link prefix, such as chapter- or og-chapter-, without slashes or spaces.'
         if not self.title.strip():
             errors['title'] = 'Enter the book title.'
         if self.start < 1 or self.end < self.start:
@@ -152,19 +155,37 @@ def safe_filename(title):
     return name[:180] + '.epub'
 
 
+# Title and content selectors for websites whose markup differs from the defaults.
+SITE_SELECTORS = {
+    'wuxiaworld.com': ('h4', 'div.chapter-body'),
+}
+
+
+def site_selectors(url):
+    """Return (title_selector, content_selector) for a known website, or None."""
+    host = (urlparse(url.strip()).hostname or '').lower()
+    for domain, selectors in SITE_SELECTORS.items():
+        if host == domain or host.endswith('.' + domain):
+            return selectors
+    return None
+
+
 def split_novel_url(value):
-    """Split a novel or chapter URL into a website base and novel ID."""
+    """Split a novel or chapter URL into a website base, novel ID and chapter link prefix."""
     if not http_url(value):
         raise ValueError('Paste a full novel URL beginning with https:// or http://.')
     parsed = urlparse(value.strip())
     parts = parsed.path.strip('/').split('/')
-    if parts and re.fullmatch(r'chapter-\d+.*', parts[-1]):
+    prefix = 'chapter-'
+    chapter = re.fullmatch(r'([\w.-]*?chapter-)\d+.*', parts[-1], re.IGNORECASE) if parts else None
+    if chapter:
+        prefix = chapter.group(1)
         parts.pop()
     if len(parts) < 2:
         raise ValueError('Paste the novel page URL, including its novel ID.')
     novel_id = parts.pop()
     base = f'{parsed.scheme}://{parsed.netloc}/' + '/'.join(parts) + '/'
-    return base, novel_id
+    return base, novel_id, prefix
 
 
 @dataclass
@@ -212,7 +233,7 @@ def run_job(settings: JobSettings, cancel: Event, log: Callable,
         log(f'Creating “{settings.title}” — {total} chapters requested.')
         for number in range(settings.start, settings.end + 1):
             check_cancel()
-            url = f'{settings.base_url.rstrip("/")}/{settings.novel_id.strip()}/chapter-{number}'
+            url = f'{settings.base_url.rstrip("/")}/{settings.novel_id.strip()}/{settings.chapter_prefix}{number}'
             progress({'stage': 'fetching', 'number': number, 'current': number - settings.start,
                       'total': total, 'success': len(chapters), 'failed': len(failed), 'title': url})
             title, content, notes, footnotes = scraper.get_chapter_content(url)

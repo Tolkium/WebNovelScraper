@@ -18,11 +18,14 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from desktop_service import JobSettings, read_epub, run_job, split_novel_url
 from WebNovelDesktop import DesktopWindow
-from WebNovelScraper import RateLimiter, ScraperCancelled
+from WebNovelScraper import RateLimiter, ScraperCancelled, parse_arguments
 
 
 class FixtureWebsite(BaseHTTPRequestHandler):
+    requested = []
+
     def do_GET(self):
+        self.requested.append(self.path)
         if self.path == '/cover.jpg':
             stream = BytesIO()
             Image.new('RGB', (1000, 1800), '#23766a').save(stream, format='JPEG')
@@ -36,7 +39,9 @@ class FixtureWebsite(BaseHTTPRequestHandler):
             number = self.path.rsplit('-', 1)[-1]
             content = (f'<html><span class="chapter-title">Original chapter {number}</span>'
                        '<div id="chapter-container">'
-                       '<p>' + 'This is the chapter story, ready to be read aloud. ' * 8 + '<sup>1</sup></p>'
+                       '<p>' + 'This is the chapter story, ready to be read aloud. ' * 8 + '<sup>1</sup>'
+                       '<span aria-hidden="true"><button>17 comments</button></span>'
+                       '<button class="spoiler">revealed line</button></p>'
                        '<p>1. Footnote: a useful explanation.</p>'
                        '<p>T/N: a translator note.</p>'
                        '<script>unwanted advertising</script></div></html>').encode()
@@ -75,6 +80,7 @@ class DesktopTests(unittest.TestCase):
                                     title='Fixture book', start=1, end=2,
                                     output_dir=str(self.root), retries=1, requests_per_second=20)
         self.logs, self.updates = [], []
+        FixtureWebsite.requested.clear()
 
     def tearDown(self):
         self.temp.cleanup()
@@ -123,6 +129,8 @@ class DesktopTests(unittest.TestCase):
             self.assertIn('translator note', content)
             self.assertIn('style/nav.css', content)
             self.assertNotIn('unwanted advertising', content)
+            self.assertNotIn('17 comments', content)
+            self.assertIn('revealed line', content)
             cover = Image.open(BytesIO(archive.read('EPUB/cover.jpg')))
             self.assertEqual(cover.height, 600)
             self.assertEqual(cover.width, 400)
@@ -204,9 +212,11 @@ class DesktopTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, .2)
 
     def test_validation_url_parsing_and_settings_round_trip(self):
-        base, novel = split_novel_url('https://example.com/novel/my-book/chapter-42?test=yes')
+        base, novel, prefix = split_novel_url('https://example.com/novel/my-book/chapter-42?test=yes')
         self.assertEqual(base, 'https://example.com/novel/')
         self.assertEqual(novel, 'my-book')
+        self.assertEqual(prefix, 'chapter-')
+        self.assertEqual(split_novel_url('https://example.com/novel/my-book')[2], 'chapter-')
         self.assertEqual(JobSettings.from_dict(json.loads(json.dumps(self.settings.to_dict()))), self.settings)
         self.settings.start = 5
         self.settings.filename = '../outside.epub'
@@ -215,6 +225,51 @@ class DesktopTests(unittest.TestCase):
         self.assertTrue({'start', 'filename', 'base_url', 'title_selector'} <= self.settings.validate().keys())
         with self.assertRaises(ValueError):
             JobSettings.from_dict({'include_notes': 'false'})
+
+    def test_chapter_prefix_from_pasted_url_is_used_for_every_chapter(self):
+        base, novel, prefix = split_novel_url(self.base + '/novel/fixture/og-chapter-2')
+        self.assertEqual((base, novel, prefix), (self.base + '/novel/', 'fixture', 'og-chapter-'))
+        self.settings.chapter_prefix = prefix
+        self.settings.simple_chapters = True
+        result = self.job()
+        self.assertEqual(result.success, 2)
+        self.assertEqual(FixtureWebsite.requested, ['/novel/fixture/og-chapter-1', '/novel/fixture/og-chapter-2'])
+        self.assertEqual([title for title, _ in read_epub(result.path)[1]], ['Chapter 1', 'Chapter 2'])
+        self.assertEqual(split_novel_url(self.base + '/novel/fixture/Chapter-7')[1:], ('fixture', 'Chapter-'))
+        self.settings.chapter_prefix = ''
+        self.assertNotIn('chapter_prefix', self.settings.validate())
+        self.settings.chapter_prefix = 'bad/prefix-'
+        self.assertIn('chapter_prefix', self.settings.validate())
+
+    def test_cli_chapter_prefix_argument(self):
+        with patch('sys.argv', ['WebNovelScraper.py']):
+            self.assertEqual(parse_arguments().chapter_prefix, 'chapter-')
+        with patch('sys.argv', ['WebNovelScraper.py', '--chapter-prefix', 'og-chapter-']):
+            self.assertEqual(parse_arguments().chapter_prefix, 'og-chapter-')
+
+    def test_simple_chapter_names_use_the_number_at_the_end_of_the_url(self):
+        self.settings.novel_id = 'the-chapter-9-saga'
+        self.settings.chapter_prefix = 'ch-'
+        self.settings.simple_chapters = True
+        result = self.job()
+        self.assertEqual([title for title, _ in read_epub(result.path)[1]], ['Chapter 1', 'Chapter 2'])
+
+    def test_known_site_url_fills_selectors_and_other_sites_restore_defaults(self):
+        window = self.window()
+        try:
+            window.novel_url.setText('https://www.wuxiaworld.com/novel/overgeared/og-chapter-2')
+            window._use_url()
+            settings = window._collect_settings()
+            self.assertEqual((settings.base_url, settings.novel_id, settings.chapter_prefix,
+                              settings.title_selector, settings.content_selector),
+                             ('https://www.wuxiaworld.com/novel/', 'overgeared', 'og-chapter-', 'h4', 'div.chapter-body'))
+            window.novel_url.setText('https://other.example/novel/my-book/chapter-1')
+            window._use_url()
+            settings = window._collect_settings()
+            self.assertEqual((settings.chapter_prefix, settings.title_selector, settings.content_selector),
+                             ('chapter-', JobSettings.title_selector, JobSettings.content_selector))
+        finally:
+            window.close()
 
     def test_gui_navigation_all_settings_preview_and_persistence(self):
         result = self.job()
