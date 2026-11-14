@@ -1,21 +1,25 @@
 """Desktop jobs and EPUB previews, independent of the GUI event loop."""
 
 from dataclasses import asdict, dataclass, fields
+from functools import partial
 from pathlib import Path
 from threading import Event
 from typing import Callable, Optional
 from urllib.parse import urlparse
+import json
 import os
 import re
+import sys
 import tempfile
 import shutil
 
 from bs4 import BeautifulSoup
 from ebooklib import epub, ITEM_DOCUMENT
+import requests
 import soupsieve
 
 from WebNovelScraper import (
-    Config, EpubCreator, ScraperCancelled, ScraperConstants, WebNovelScraper,
+    Config, EpubCreator, ScraperCancelled, ScraperConstants, WebNovelScraper, is_browser_check, read_saved_chapters,
 )
 
 
@@ -24,6 +28,7 @@ class JobSettings:
     base_url: str = ''
     novel_id: str = ''
     chapter_prefix: str = 'chapter-'
+    saved_file: str = ''
     title: str = ''
     start: int = 1
     end: int = 10
@@ -78,12 +83,16 @@ class JobSettings:
 
     def validate(self):
         errors = {}
-        if not http_url(self.base_url):
-            errors['base_url'] = 'Enter a full website base URL beginning with https:// or http://.'
-        if not self.novel_id.strip() or re.search(r'[/\\?#\s]', self.novel_id):
-            errors['novel_id'] = 'Enter the novel ID from the URL, without slashes, spaces or query parameters.'
-        if not re.fullmatch(r'[\w.-]*', self.chapter_prefix):
-            errors['chapter_prefix'] = 'Enter the chapter link prefix, such as chapter- or og-chapter-, without slashes or spaces.'
+        if self.saved_file:
+            if not Path(self.saved_file).expanduser().exists():
+                errors['saved_file'] = 'The saved chapters file was not found. Choose it again with Browse.'
+        else:
+            if not http_url(self.base_url):
+                errors['base_url'] = 'Enter a full website base URL beginning with https:// or http://.'
+            if not self.novel_id.strip() or re.search(r'[/\\?#\s]', self.novel_id):
+                errors['novel_id'] = 'Enter the novel ID from the URL, without slashes, spaces or query parameters.'
+            if not re.fullmatch(r'[\w.-]*', self.chapter_prefix):
+                errors['chapter_prefix'] = 'Enter the chapter link prefix, such as chapter- or og-chapter-, without slashes or spaces.'
         if not self.title.strip():
             errors['title'] = 'Enter the book title.'
         if self.start < 1 or self.end < self.start:
@@ -170,6 +179,31 @@ def site_selectors(url):
     return None
 
 
+def site_blocks_app(url, user_agent, timeout=15):
+    """True when url answers with a browser check; network errors are left for the job to report."""
+    try:
+        response = requests.get(url, headers={'User-Agent': user_agent}, timeout=timeout)
+    except requests.RequestException:
+        return False
+    return is_browser_check(response)
+
+
+BROWSER_SCRIPT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / 'browser' / 'collect-chapters.js'
+
+
+def browser_script(settings):
+    """The browser console script from browser/collect-chapters.js, set up for the book in settings."""
+    values = {
+        'chapterUrl': f'{settings.base_url.rstrip("/")}/{settings.novel_id.strip()}/{settings.chapter_prefix}{{n}}',
+        'name': settings.novel_id.strip(),
+        'start': settings.start,
+        'end': settings.end,
+        'titleSelector': settings.title_selector,
+        'contentSelector': settings.content_selector,
+    }
+    return BROWSER_SCRIPT.read_text(encoding='utf-8').replace('/*SETTINGS*/null', json.dumps(values), 1)
+
+
 def split_novel_url(value):
     """Split a novel or chapter URL into a website base, novel ID and chapter link prefix."""
     if not http_url(value):
@@ -205,12 +239,26 @@ def run_job(settings: JobSettings, cancel: Event, log: Callable,
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() and not overwrite:
         raise FileExistsError(f'{output.name} already exists. Choose another filename.')
+    if settings.saved_file:
+        saved = [(number, section) for number, section in read_saved_chapters(settings.saved_file)
+                 if settings.start <= number <= settings.end]
+        if not saved:
+            raise ValueError(f'No saved chapters {settings.start} to {settings.end} in {Path(settings.saved_file).name}. '
+                             'Check the chapter range or choose another file.')
     log_path.parent.mkdir(parents=True, exist_ok=True)
     config = settings.config()
     scraper = WebNovelScraper(settings.debug, settings=config, constants=settings.constants(),
                               cancel_event=cancel, log_callback=log, log_path=log_path)
     chapters, failed = [], []
-    total = settings.end - settings.start + 1
+    if settings.saved_file:
+        sources = [(number, f'saved chapter {number}', partial(scraper.parse_saved_chapter, section, number))
+                   for number, section in saved]
+    else:
+        sources = []
+        for number in range(settings.start, settings.end + 1):
+            url = f'{settings.base_url.rstrip("/")}/{settings.novel_id.strip()}/{settings.chapter_prefix}{number}'
+            sources.append((number, url, partial(scraper.get_chapter_content, url)))
+    total = len(sources)
     temp_path = None
 
     def check_cancel():
@@ -231,21 +279,25 @@ def run_job(settings: JobSettings, cancel: Event, log: Callable,
             else:
                 log('Warning: the cover could not be loaded. Continuing without a cover.')
         log(f'Creating “{settings.title}” — {total} chapters requested.')
-        for number in range(settings.start, settings.end + 1):
+        for index, (number, source, load) in enumerate(sources):
             check_cancel()
-            url = f'{settings.base_url.rstrip("/")}/{settings.novel_id.strip()}/{settings.chapter_prefix}{number}'
-            progress({'stage': 'fetching', 'number': number, 'current': number - settings.start,
-                      'total': total, 'success': len(chapters), 'failed': len(failed), 'title': url})
-            title, content, notes, footnotes = scraper.get_chapter_content(url)
+            progress({'stage': 'fetching', 'number': number, 'current': index,
+                      'total': total, 'success': len(chapters), 'failed': len(failed), 'title': source})
+            title, content, notes, footnotes = load()
             check_cancel()
             if title and content:
                 chapters.append({'title': title, 'content': content, 'notes': notes or [], 'footnotes': footnotes or {}})
-                log(f'Chapter {number}: {title}')
+                # Simple names only repeat the number; the word count shows a chapter that came through short.
+                heading = f'Chapter {number}' if title == f'Chapter {number}' else f'Chapter {number}: {title}'
+                log(f'{heading} — {len(BeautifulSoup(content, "html.parser").get_text().split()):,} words')
+            elif settings.saved_file:
+                failed.append(number)
+                log(f'Warning: saved chapter {number} has no usable text.')
             else:
                 failed.append(number)
                 log(f'Warning: chapter {number} failed after {settings.retries} attempts.')
             progress({'stage': 'downloaded' if title and content else 'failed', 'number': number,
-                      'current': number - settings.start + 1, 'total': total,
+                      'current': index + 1, 'total': total,
                       'success': len(chapters), 'failed': len(failed), 'title': title or 'Could not download'})
         if not chapters:
             raise ValueError('No chapters could be downloaded. Check the novel URL and Advanced page selectors. See Activity for details.')

@@ -15,6 +15,8 @@ import argparse
 from dataclasses import dataclass
 from urllib.parse import urlparse
 from html import escape
+from pathlib import Path
+import sys
 
 class ChapterData(TypedDict):
     title: str
@@ -65,6 +67,18 @@ class ScraperError(Exception):
 
 class ScraperCancelled(Exception):
     """A user requested cancellation between requests or during a wait."""
+
+class SiteBlocked(Exception):
+    """The website answered with a browser check, so chapters must be collected in the browser."""
+
+    def __init__(self, url: str):
+        super().__init__(f"{urlparse(url).netloc} shows a browser check, so the app cannot read its chapters.")
+
+def is_browser_check(response: requests.Response) -> bool:
+    """True when the response is a Cloudflare check page instead of the requested page."""
+    return response.status_code in (403, 503) and (
+        response.headers.get('cf-mitigated') == 'challenge'
+        or 'cloudflare' in response.headers.get('server', '').lower())
 
 class CallbackLogHandler(logging.Handler):
     def __init__(self, callback):
@@ -262,7 +276,8 @@ class WebNovelScraper:
             't/n:', 'tn:', 't/l:', 'tl:',
             'translator\'s note:', 'translator note:',
             'chapter note:', 'chapter note by',
-            'thanks for playing', 'as always'
+            'thanks for playing', 'as always',
+            'glossary of common', 'glossary link', 'current schedule:', 'check out my patreon'
         ])
 
     def _process_content(self, content_div: BeautifulSoup) -> Tuple[List[str], List[str], Dict[str, str], List[str]]:
@@ -341,50 +356,20 @@ class WebNovelScraper:
                 self.rate_limiter.wait()
                 
                 response = self.session.get(url, timeout=self.constants.DEFAULT_TIMEOUT)
+                if is_browser_check(response):
+                    raise SiteBlocked(url)
                 response.raise_for_status()
                 
                 if not response.text.strip():
                     raise ValueError("Empty response received")
                 
-                # First parse the full HTML
                 soup = BeautifulSoup(response.text, 'html.parser')
-                
-                title_elem = soup.select_one(self.constants.TITLE_SELECTOR)
-                chapter_title = self._process_chapter_title(title_elem, url)
-                
-                if not chapter_title:
-                    raise ValueError("Chapter title not found")
-
-                # Find the chapter container and process its content
-                content_div = soup.select_one(self.constants.CONTENT_SELECTOR)
-                if not content_div:
-                    raise ValueError("Content container not found")
-
-                if self.debug_mode:
-                    self.logger.debug(f"\nProcessing chapter: {chapter_title}")
-                    self.logger.debug(f"URL: {url}")
-
-                paragraphs, after_separator, footnotes, debug_notes = self._process_content(content_div)
-
-                if len(paragraphs) == 0:
-                    if self.debug_mode:
-                        self.logger.debug("\nNo paragraphs found in content. Raw content:")
-                        self.logger.debug(content_div.prettify())
-                    raise ValueError("No valid content found")
-
-                content = self._format_chapter_content(paragraphs, footnotes)
-                if len(BeautifulSoup(content, 'html.parser').get_text(strip=True)) < self.constants.MIN_CONTENT_LENGTH:
-                    raise ValueError('Chapter content is shorter than the configured minimum length')
-                
-                if self.debug_mode and debug_notes:
-                    self.logger.debug(f"\nExcluded notes for {chapter_title}:")
-                    for note in debug_notes:
-                        self.logger.debug(f"Note: {note}")
-                
+                chapter = self.parse_chapter(soup.select_one(self.constants.TITLE_SELECTOR),
+                                             soup.select_one(self.constants.CONTENT_SELECTOR), url)
                 self.rate_limiter.record_success()
-                return chapter_title, content, after_separator, footnotes
+                return chapter
 
-            except ScraperCancelled:
+            except (ScraperCancelled, SiteBlocked):
                 raise
             except Exception as e:
                 self.logger.error(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
@@ -399,12 +384,58 @@ class WebNovelScraper:
 
         return None, None, None, None
 
+    def parse_chapter(self, title_elem: Optional[BeautifulSoup], content_div: Optional[BeautifulSoup],
+                      source: str) -> Tuple[str, str, List[str], Dict[str, str]]:
+        """Turn a chapter's title element and content container into EPUB-ready parts.
+
+        source is the chapter URL, or the chapter number for saved chapters.
+        Raises ValueError when the title or usable content is missing.
+        """
+        chapter_title = self._process_chapter_title(title_elem, source)
+        if not chapter_title:
+            raise ValueError("Chapter title not found")
+        if not content_div:
+            raise ValueError("Content container not found")
+
+        if self.debug_mode:
+            self.logger.debug(f"\nProcessing chapter: {chapter_title}")
+            self.logger.debug(f"Source: {source}")
+
+        paragraphs, after_separator, footnotes, debug_notes = self._process_content(content_div)
+
+        if len(paragraphs) == 0:
+            if self.debug_mode:
+                self.logger.debug("\nNo paragraphs found in content. Raw content:")
+                self.logger.debug(content_div.prettify())
+            raise ValueError("No valid content found")
+
+        content = self._format_chapter_content(paragraphs, footnotes)
+        if len(BeautifulSoup(content, 'html.parser').get_text(strip=True)) < self.constants.MIN_CONTENT_LENGTH:
+            raise ValueError('Chapter content is shorter than the configured minimum length')
+
+        if self.debug_mode and debug_notes:
+            self.logger.debug(f"\nExcluded notes for {chapter_title}:")
+            for note in debug_notes:
+                self.logger.debug(f"Note: {note}")
+
+        return chapter_title, content, after_separator, footnotes
+
+    def parse_saved_chapter(self, section: BeautifulSoup, number: Union[int, float]) ->Tuple[Optional[str], Optional[str], Optional[List[str]], Optional[dict]]:
+        """Process one chapter saved by browser/collect-chapters.js; returns Nones when it is unusable."""
+        repair_split_words(section)
+        try:
+            return self.parse_chapter(section.select_one('.chapter-title'),
+                                      section.select_one('.chapter-container'), str(number))
+        except ValueError as e:
+            self.logger.error(f"Saved chapter {number} failed: {e}")
+            return None, None, None, None
+
     def _process_chapter_title(self, title_elem: Optional[BeautifulSoup], url: str) -> Optional[str]:
         if not title_elem:
             return None
             
         if self.config.SIMPLE_CHAPTER_NAMES:
-            url_match = re.search(r'(\d+)/?$', urlparse(url).path)
+            url_match = re.search(r'(\d+(?:\.\d+)?)/?$', urlparse(url).path)
             return f"Chapter {url_match.group(1)}" if url_match else title_elem.text.strip()
         return title_elem.text.strip()
 
@@ -565,6 +596,36 @@ class EpubCreator:
         )
         self.book.add_item(nav_css)
 
+SPLIT_WORD = re.compile(r'\b[A-Za-z]+(?:\.[A-Za-z]+)+\b')
+
+def _join_split_word(match: re.Match) -> str:
+    parts = match.group().split('.')
+    # Join only when a single letter was split off and the word continues in lowercase,
+    # so sentences missing a space ("first.I") and acronyms ("L.T.S") stay as they are.
+    if any(len(part) == 1 for part in parts) and all(part[0].islower() for part in parts[1:]):
+        return ''.join(parts)
+    return match.group()
+
+def repair_split_words(element: BeautifulSoup) -> None:
+    """Rejoin words split with dots, such as s.h.i.+eld or a.s.sa.s.sin, so TTS reads them as words."""
+    for text in element.find_all(string=True):
+        fixed = re.sub(r'\.([!?])\.\+', r'\1', text).replace('.+', '')
+        fixed = SPLIT_WORD.sub(_join_split_word, fixed)
+        if fixed != text:
+            text.replace_with(fixed)
+
+def read_saved_chapters(location) -> List[Tuple[Union[int, float], BeautifulSoup]]:
+    """Read chapters saved by browser/collect-chapters.js from one .html file, or every one in a folder, in chapter order."""
+    location = Path(location).expanduser()
+    chapters = {}
+    for path in [location] if location.is_file() else sorted(location.glob('*.html')):
+        soup = BeautifulSoup(path.read_text(encoding='utf-8'), 'html.parser')
+        for section in soup.select('section.wns-chapter[data-number]'):
+            # In-between chapters such as 769.1 keep their decimal number.
+            number = float(section['data-number'])
+            chapters[int(number) if number.is_integer() else number] = section
+    return sorted(chapters.items())
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Web Novel Scraper')
     
@@ -576,6 +637,8 @@ def parse_arguments() -> argparse.Namespace:
     required.add_argument('--title', type=str, help='Novel title')
     parser.add_argument('--chapter-prefix', type=str, default='chapter-',
                         help='Text before the chapter number in chapter URLs (default: chapter-)')
+    parser.add_argument('--from-folder', type=str,
+                        help='Build from chapter files saved by browser/collect-chapters.js instead of downloading')
     
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--cover-url', type=str, help='Cover image URL')
@@ -608,17 +671,22 @@ def get_user_input(args: argparse.Namespace) -> Dict[str, str]:
     print("\nWeb Novel Scraper")
     print("==================")
 
-    inputs['base_url'] = args.url if args.url else input("\nEnter base URL: ").strip()
-    if not inputs['base_url']:
-        raise ValidationError("Base URL cannot be empty")
-    if not inputs['base_url'].endswith('/'):
-        inputs['base_url'] += '/'
+    if not args.from_folder:
+        inputs['base_url'] = args.url if args.url else input("\nEnter base URL: ").strip()
+        if not inputs['base_url']:
+            raise ValidationError("Base URL cannot be empty")
+        if not inputs['base_url'].endswith('/'):
+            inputs['base_url'] += '/'
 
-    inputs['novel_id'] = args.novel_id if args.novel_id else input("Novel ID: ").strip()
-    if not inputs['novel_id']:
-        raise ValidationError("Novel ID cannot be empty")
+        inputs['novel_id'] = args.novel_id if args.novel_id else input("Novel ID: ").strip()
+        if not inputs['novel_id']:
+            raise ValidationError("Novel ID cannot be empty")
 
-    if args.start and args.end:
+    if args.from_folder:
+        # Saved chapters need no range; --start and --end only narrow it.
+        inputs['start_chapter'] = args.start or 1
+        inputs['end_chapter'] = args.end or sys.maxsize
+    elif args.start and args.end:
         inputs['start_chapter'] = args.start
         inputs['end_chapter'] = args.end
     else:
@@ -697,9 +765,14 @@ def main() -> None:
         inputs = get_user_input(args)
 
         print("\nFinal Configuration:")
-        print(f"Base URL: {inputs['base_url']}")
-        print(f"Novel ID: {inputs['novel_id']}")
-        print(f"Chapters: {inputs['start_chapter']} to {inputs['end_chapter']}")
+        if args.from_folder:
+            last = 'last saved' if inputs['end_chapter'] == sys.maxsize else inputs['end_chapter']
+            print(f"Saved chapters folder: {args.from_folder}")
+            print(f"Chapters: {inputs['start_chapter']} to {last}")
+        else:
+            print(f"Base URL: {inputs['base_url']}")
+            print(f"Novel ID: {inputs['novel_id']}")
+            print(f"Chapters: {inputs['start_chapter']} to {inputs['end_chapter']}")
         print(f"Title: {inputs['novel_title']}")
         print(f"Debug Mode: {'On' if Config.DEBUG_MODE else 'Off'}")
         print(f"Simple Chapter Names: {'On' if Config.SIMPLE_CHAPTER_NAMES else 'Off'}")
@@ -720,8 +793,21 @@ def main() -> None:
             return
 
         scraper = WebNovelScraper(debug_mode=Config.DEBUG_MODE)
-        progress = ProgressTracker(inputs['end_chapter'] - inputs['start_chapter'] + 1)
-        
+        first, last = inputs['start_chapter'], inputs['end_chapter']
+        if args.from_folder:
+            saved = [(number, section) for number, section in read_saved_chapters(args.from_folder)
+                     if first <= number <= last]
+            if not saved:
+                raise ValidationError(f"No saved chapters found in {args.from_folder}")
+            total = len(saved)
+            results = ((number, scraper.parse_saved_chapter(section, number)) for number, section in saved)
+        else:
+            numbers = range(first, last + 1)
+            total = len(numbers)
+            results = ((number, scraper.get_chapter_content(
+                f"{inputs['base_url']}{inputs['novel_id']}/{args.chapter_prefix}{number}")) for number in numbers)
+        progress = ProgressTracker(total)
+
         chapters_data = []
         epub_creator = EpubCreator(
             inputs['novel_title'],
@@ -737,11 +823,7 @@ def main() -> None:
             else:
                 print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process cover image{ConsoleColors.RESET}")
 
-        for chapter_num in range(inputs['start_chapter'], inputs['end_chapter'] + 1):
-            url = f"{inputs['base_url']}{inputs['novel_id']}/{args.chapter_prefix}{chapter_num}"
-            
-            chapter_title, content, notes, footnotes = scraper.get_chapter_content(url)
-            
+        for chapter_num, (chapter_title, content, notes, footnotes) in results:
             if chapter_title and content:
                 chapters_data.append({
                     'title': chapter_title,
@@ -776,6 +858,10 @@ def main() -> None:
 
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
+    except SiteBlocked as e:
+        print(f"\n{ConsoleColors.RED}{e}{ConsoleColors.RESET}")
+        print("Collect the chapters in your browser with browser/collect-chapters.js, "
+              "then build with --from-folder.")
     except Exception as e:
         print(f"\n{ConsoleColors.RED}Error: {str(e)}{ConsoleColors.RESET}")
         if Config.DEBUG_MODE:

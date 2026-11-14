@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
 import time
@@ -14,11 +15,12 @@ from zipfile import ZipFile
 from ebooklib import epub
 from PIL import Image
 from PySide6.QtCore import QSettings
+from PySide6.QtQml import QJSEngine
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from desktop_service import JobSettings, read_epub, run_job, split_novel_url
+from desktop_service import JobSettings, browser_script, read_epub, run_job, split_novel_url
 from WebNovelDesktop import DesktopWindow
-from WebNovelScraper import RateLimiter, ScraperCancelled, parse_arguments
+from WebNovelScraper import RateLimiter, ScraperCancelled, SiteBlocked, parse_arguments
 
 
 class FixtureWebsite(BaseHTTPRequestHandler):
@@ -32,6 +34,10 @@ class FixtureWebsite(BaseHTTPRequestHandler):
             content = stream.getvalue()
             self.send_response(200)
             self.send_header('Content-Type', 'image/jpeg')
+        elif self.path.startswith('/blocked/'):
+            self.send_response(403)
+            self.send_header('cf-mitigated', 'challenge')
+            content = b'Just a moment...'
         elif self.path.endswith('/chapter-3'):
             self.send_response(500)
             content = b'Fixture chapter unavailable'
@@ -92,6 +98,7 @@ class DesktopTests(unittest.TestCase):
     def window(self):
         preferences = QSettings(str(self.root / 'preferences.ini'), QSettings.Format.IniFormat)
         window = DesktopWindow(preferences, data_dir=self.root)
+        window.access_check = lambda url, user_agent: False
         window._apply_settings(self.settings)
         return window
 
@@ -241,6 +248,84 @@ class DesktopTests(unittest.TestCase):
         self.settings.chapter_prefix = 'bad/prefix-'
         self.assertIn('chapter_prefix', self.settings.validate())
 
+    def test_browser_check_stops_the_job_at_once(self):
+        self.settings.base_url = self.base + '/blocked/'
+        self.settings.retries = 3
+        with self.assertRaises(SiteBlocked):
+            self.job()
+        self.assertEqual(FixtureWebsite.requested, ['/blocked/fixture/chapter-1'])
+
+    def test_browser_script_is_made_for_the_current_book(self):
+        self.settings.start, self.settings.end = 105, 125
+        self.settings.chapter_prefix = 'og-chapter-'
+        self.settings.content_selector = 'div.story'
+        script = browser_script(self.settings)
+        settings = json.loads(re.search(r'const SETTINGS = (\{.*?\});', script).group(1))
+        self.assertEqual(settings, {'chapterUrl': self.base + '/novel/fixture/og-chapter-{n}', 'name': 'fixture',
+                                    'start': 105, 'end': 125, 'titleSelector': 'span.chapter-title',
+                                    'contentSelector': 'div.story'})
+        self.assertNotIn('BATCH_SIZE', script)
+        # This Qt JavaScript engine has no async/await; dropping both still checks the rest of the syntax.
+        engine = QJSEngine()
+        parsed = engine.evaluate('new Function(' + json.dumps(re.sub(r'\b(async|await)\b', '', script)) + ')')
+        self.assertFalse(parsed.isError(), parsed.toString())
+
+    def test_blocked_url_opens_browser_section_and_copies_script_for_the_book(self):
+        window = self.window()
+        window.access_check = lambda url, user_agent: url.endswith('/chapter-105')
+        try:
+            self.assertFalse(window.browser_toggle.isChecked())
+            self.assertTrue(window.browser_panel.isHidden())
+            with patch.object(QMessageBox, 'information') as information:
+                window.novel_url.setText(self.base + '/novel/other-book/chapter-105')
+                window._use_url()
+                self.wait_until(lambda: information.called)
+            self.assertTrue(window.browser_toggle.isChecked())
+            self.assertFalse(window.browser_panel.isHidden())
+            self.assertIn('browser check', information.call_args.args[2])
+            window._copy_browser_script()
+            self.assertIn(f'"chapterUrl": "{self.base}/novel/other-book/chapter-{{n}}"', QApplication.clipboard().text())
+            self.assertIn('copied', window.browser_status.text())
+        finally:
+            window.close()
+
+    def test_copy_script_asks_for_the_source_first(self):
+        self.settings.base_url = ''
+        window = self.window()
+        try:
+            with patch.object(QMessageBox, 'warning') as warning, patch('WebNovelDesktop.browser_script') as script:
+                window._copy_browser_script()
+            warning.assert_called_once()
+            self.assertIn('base URL', warning.call_args.args[2])
+            script.assert_not_called()
+        finally:
+            window.close()
+
+    def test_gui_job_on_blocked_site_opens_browser_section(self):
+        self.settings.base_url = self.base + '/blocked/'
+        window = self.window()
+        try:
+            with patch.object(QMessageBox, 'exec', return_value=QMessageBox.StandardButton.Ok), \
+                    patch.object(QMessageBox, 'information') as information, patch.object(QMessageBox, 'warning') as warning:
+                window._start_job()
+                self.wait_until(lambda: window.thread is None)
+            information.assert_called_once()
+            warning.assert_not_called()
+            self.assertTrue(window.browser_toggle.isChecked())
+            self.assertEqual(window.stack.currentIndex(), 0)
+            self.assertTrue(window.create_button.isEnabled())
+        finally:
+            window.close()
+
+    def test_saved_file_setting_opens_browser_section(self):
+        self.settings.saved_file = str(self.root / 'novel-1-2.html')
+        window = self.window()
+        try:
+            self.assertTrue(window.browser_toggle.isChecked())
+            self.assertEqual(window._collect_settings().saved_file, self.settings.saved_file)
+        finally:
+            window.close()
+
     def test_cli_chapter_prefix_argument(self):
         with patch('sys.argv', ['WebNovelScraper.py']):
             self.assertEqual(parse_arguments().chapter_prefix, 'chapter-')
@@ -253,6 +338,11 @@ class DesktopTests(unittest.TestCase):
         self.settings.simple_chapters = True
         result = self.job()
         self.assertEqual([title for title, _ in read_epub(result.path)[1]], ['Chapter 1', 'Chapter 2'])
+        self.assertIn('Chapter 1 — 82 words', self.logs)
+
+    def test_log_shows_original_titles_and_word_counts(self):
+        self.job()
+        self.assertIn('Chapter 1: Original chapter 1 — 82 words', self.logs)
 
     def test_known_site_url_fills_selectors_and_other_sites_restore_defaults(self):
         window = self.window()

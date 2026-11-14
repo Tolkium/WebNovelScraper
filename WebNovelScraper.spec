@@ -5,7 +5,7 @@ a = Analysis(
     ['WebNovelDesktop.py'],
     pathex=[],
     binaries=[],
-    datas=[('icon.ico', '.'), ('webnovel_assets/chevron-up.svg', 'webnovel_assets'), ('webnovel_assets/chevron-down.svg', 'webnovel_assets'), ('webnovel_assets/check.svg', 'webnovel_assets')],
+    datas=[('icon.ico', '.'), ('webnovel_assets/chevron-up.svg', 'webnovel_assets'), ('webnovel_assets/chevron-down.svg', 'webnovel_assets'), ('webnovel_assets/check.svg', 'webnovel_assets'), ('browser/collect-chapters.js', 'browser')],
     hiddenimports=['PySide6.QtSvg'],
     hookspath=[],
     hooksconfig={},

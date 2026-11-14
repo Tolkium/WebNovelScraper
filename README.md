@@ -163,12 +163,32 @@ Command-line Options:
 - `--include-footnotes`: Include footnotes in output
 - `--include-notes`: Include chapter notes in output
 - `--chapter-prefix`: Text before the chapter number in chapter URLs (default `chapter-`)
+- `--from-folder`: Build from a chapter file, or a folder of them, saved in the browser instead of downloading
 
 Example:
 
 ```bash
 python WebNovelScraper.py --url "https://example.com/novel/" --novel-id "novel-name-123" --start 1 --end 10 --title "My Novel" --cover-url "https://example.com/cover.jpg" --author "Author Name" --simple-chapters
 ```
+
+### Chapters saved from the browser
+
+Some websites block the app with a browser check and only show chapters in a real browser. For those, `browser/collect-chapters.js` collects the chapters your browser shows.
+
+In the desktop app, the browser check is detected when you click **Use this URL** or start a job, and **Get chapters from your browser** opens on Novel setup:
+
+1. Fill in the source and chapter range, then click **Copy script**. The script is made for that book and range.
+2. Open a chapter page of the book in your browser, press `F12`, open **Console**, paste the script and press Enter.
+3. Confirm the first and last chapter in the popups. All chapters are saved to one file in Downloads.
+4. Click **Browse…**, choose the saved file and click **Review and create EPUB**.
+
+From the command line, paste `browser/collect-chapters.js` as it is on a chapter page whose address ends in the chapter number, move the saved files into `imports/` and build the EPUB:
+
+```bash
+python WebNovelScraper.py --from-folder imports --title "My Novel" --simple-chapters
+```
+
+`--from-folder` takes one saved file or a folder of them. Use `--start` and `--end` to build only part of the saved chapters. Words split with dots, such as `s.h.i.+eld`, are rejoined so text-to-speech reads them correctly.
 
 ## Building Executable
 

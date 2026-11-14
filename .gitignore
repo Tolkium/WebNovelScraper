@@ -37,4 +37,6 @@ webnovel_env/
 
 # Output files
 *.epub
+imports/
+book/
 .cursorignore
