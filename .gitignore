@@ -40,3 +40,6 @@ webnovel_env/
 imports/
 book/
 .cursorignore
+
+# Design notes and plans
+docs/superpowers/

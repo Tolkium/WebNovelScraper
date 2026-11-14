@@ -58,6 +58,7 @@ Commercial use and content redistribution are outside this intended purpose. **S
 - Chapter notes support
 - Simple chapter naming option
 - Clean content filtering
+- Text-to-speech friendly text: words split with dots (`s.h.i.+eld`) are rejoined, missing spaces between sentences are added, and site watermarks, links, `[email protected]` placeholders, `(TL: ...)` notes, footnote marks, separator lines and decorative symbols are removed
 - Progress tracking with real-time status
 - Error handling and retry mechanism
 - Rate limiting to prevent server overload
@@ -189,7 +190,7 @@ From the command line, paste `browser/collect-chapters.js` as it is on a chapter
 python WebNovelScraper.py --from-folder imports --title "My Novel" --simple-chapters
 ```
 
-`--from-folder` takes one saved file or a folder of them. Use `--start` and `--end` to build only part of the saved chapters. Words split with dots, such as `s.h.i.+eld`, are rejoined so text-to-speech reads them correctly.
+`--from-folder` takes one saved file or a folder of them. Use `--start` and `--end` to build only part of the saved chapters. Saved chapters get the same text-to-speech cleanup as downloaded ones.
 
 ## Building Executable
 

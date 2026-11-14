@@ -7,7 +7,7 @@ import logging
 import time
 import re
 from typing import Optional, Tuple, List, Dict, TypedDict, Union
-from bs4.element import Comment
+from bs4.element import Comment, NavigableString
 import os
 from PIL import Image
 from io import BytesIO
@@ -57,6 +57,13 @@ class ConsoleColors:
     GREEN: str = '\033[92m'
     YELLOW: str = '\033[93m'
     RESET: str = '\033[0m'
+
+# The start of a translator note: "TL:", "T/N:", "TL Note:".
+TL_NOTE_START = r'T/?[LN](?:\s*note)?\s*:'
+NOTE_TEXT = re.compile(
+    rf'\b{TL_NOTE_START}|\btranslator[\'’]?s? note\b|\bchapter note(?:\s*:|\s+by\b)'
+    r'|\bthanks for playing\b|^as always,? (?:thanks|thank you|enjoy)'
+    r'|\bglossary of common\b|\bglossary link\b|\bcurrent schedule:|\bcheck out my patreon\b', re.IGNORECASE)
 
 class ValidationError(Exception):
     """Custom exception for validation errors."""
@@ -265,26 +272,19 @@ class WebNovelScraper:
         strong_elements = p_element.find_all(['strong', 'b'])
         for strong in strong_elements:
             strong_text = strong.text.strip().lower()
-            if any(note_type in strong_text for note_type in [
-                'translator\'s note', 'translator note',
-                'chapter note', 't/n', 'note'
-            ]):
+            if re.search(r'\b(?:notes?|t/n)\b', strong_text):
                 return True
 
-        # Then check regular text patterns
-        text_lower = text.lower()
-        return any(pattern in text_lower for pattern in [
-            't/n:', 'tn:', 't/l:', 'tl:',
-            'translator\'s note:', 'translator note:',
-            'chapter note:', 'chapter note by',
-            'thanks for playing', 'as always',
-            'glossary of common', 'glossary link', 'current schedule:', 'check out my patreon'
-        ])
+        # Then check regular text patterns, as whole words so story text such as "was always" stays
+        return bool(NOTE_TEXT.search(text))
 
     def _process_content(self, content_div: BeautifulSoup) -> Tuple[List[str], List[str], Dict[str, str], List[str]]:
         """Process and extract content components."""
         content_div = self._clean_html_content(content_div)
-        
+        wrap_loose_text(content_div)
+        tidy_for_speech(content_div, keep_notes=self.config.INCLUDE_CHAPTER_NOTES,
+                        keep_footnotes=self.config.INCLUDE_FOOTNOTES)
+
         paragraphs = []
         after_separator = []
         footnotes = {}
@@ -297,6 +297,7 @@ class WebNovelScraper:
             self.logger.debug(content_div.prettify())
         
         for p in content_div.find_all('p'):
+            trim_paragraph(p)
             text = p.text.strip()
             if not text:
                 continue
@@ -305,7 +306,13 @@ class WebNovelScraper:
                 self.logger.debug(f"\nProcessing paragraph: {text[:100]}...")
 
             # Always add to main content unless it's clearly a note
-            if text.startswith('T/L:') or text.startswith('T/N:'):
+            if SEPARATOR_LINE.match(text):
+                # A scene break: a line in the book instead of symbols TTS would read out.
+                if paragraphs and paragraphs[-1] != '<hr/>':
+                    paragraphs.append('<hr/>')
+            elif is_watermark(text):
+                debug_notes.append(f"Not story: {text}")
+            elif text.startswith('T/L:') or text.startswith('T/N:'):
                 if self.config.INCLUDE_CHAPTER_NOTES:
                     after_separator.append(str(p))
                 debug_notes.append(f"Start note: {str(p)}")
@@ -317,9 +324,7 @@ class WebNovelScraper:
                 debug_notes.append(f"Footnote: {text}")
                 if self.debug_mode:
                     self.logger.debug("Found footnote")
-            elif ('T/N:' in text or 'Chapter Note:' in text or 
-                'Thanks for playing' in text or 'As always' in text or
-                self._is_note_or_message(text, p)):
+            elif self._is_note_or_message(text, p):
                 found_separator = True
                 if self.config.INCLUDE_CHAPTER_NOTES:
                     after_separator.append(str(p))
@@ -329,9 +334,6 @@ class WebNovelScraper:
             else:
                 # Add to main content if it's not obviously a note
                 if not self._is_chapter_number(text):
-                    first = p.find(string=True)
-                    if first is not None and first[:1].isspace():
-                        first.replace_with(first.lstrip())
                     paragraphs.append(str(p))
                     if self.debug_mode:
                         self.logger.debug("Added to main content")
@@ -395,6 +397,9 @@ class WebNovelScraper:
         source is the chapter URL, or the chapter number for saved chapters.
         Raises ValueError when the title or usable content is missing.
         """
+        for element in (title_elem, content_div):
+            if element is not None:
+                repair_split_words(element)
         chapter_title = self._process_chapter_title(title_elem, source)
         if not chapter_title:
             raise ValueError("Chapter title not found")
@@ -426,7 +431,6 @@ class WebNovelScraper:
 
     def parse_saved_chapter(self, section: BeautifulSoup, number: Union[int, float]) ->Tuple[Optional[str], Optional[str], Optional[List[str]], Optional[dict]]:
         """Process one chapter saved by browser/collect-chapters.js; returns Nones when it is unusable."""
-        repair_split_words(section)
         try:
             return self.parse_chapter(section.select_one('.chapter-title'),
                                       section.select_one('.chapter-container'), str(number))
@@ -600,21 +604,125 @@ class EpubCreator:
 
 SPLIT_WORD = re.compile(r'\b[A-Za-z]+(?:\.[A-Za-z]+)+\b')
 
+ABBREVIATIONS = ('a.m', 'p.m', 'e.g', 'i.e', 'a.k.a')
+
 def _join_split_word(match: re.Match) -> str:
-    parts = match.group().split('.')
+    word = match.group()
+    parts = word.split('.')
+    for short in ABBREVIATIONS:
+        rest = word[len(short) + 1:]
+        if word.lower() == short:
+            return word
+        # "a.m.The" is an abbreviation before the next word; "a.m.a.z.i.n.g" is a split word.
+        if word.lower().startswith(short + '.') and len(rest) > 1 and '.' not in rest:
+            return f'{word[:len(short) + 1]} {rest}'
+    # "I.went" is a sentence missing a space; "I.t" is a split word.
+    if parts[0] == 'I' and len(parts) == 2 and len(parts[1]) > 2:
+        return word
+    # A capitalised last part starts the next sentence ("G.o.d.You").
+    next_sentence = parts.pop() if len(parts) > 2 and parts[-1][0].isupper() else ''
     # Join only when a single letter was split off and the word continues in lowercase,
     # so sentences missing a space ("first.I") and acronyms ("L.T.S") stay as they are.
     if any(len(part) == 1 for part in parts) and all(part[0].islower() for part in parts[1:]):
-        return ''.join(parts)
-    return match.group()
+        return ''.join(parts) + (f'. {next_sentence}' if next_sentence else '')
+    return word
+
+def _texts(element: BeautifulSoup) -> List[NavigableString]:
+    """The element's text nodes, without HTML comments."""
+    return [text for text in element.find_all(string=True) if not isinstance(text, Comment)]
 
 def repair_split_words(element: BeautifulSoup) -> None:
     """Rejoin words split with dots, such as s.h.i.+eld or a.s.sa.s.sin, so TTS reads them as words."""
-    for text in element.find_all(string=True):
+    for text in _texts(element):
         fixed = re.sub(r'\.([!?])\.\+', r'\1', text).replace('.+', '')
         fixed = SPLIT_WORD.sub(_join_split_word, fixed)
         if fixed != text:
             text.replace_with(fixed)
+
+# Text that TTS reads aloud but is not part of the story. Translator notes in brackets may hold
+# one level of brackets themselves: (TL: Oppa (older brother) is ...).
+NOTE_IN_BRACKETS = re.compile(rf'\s*\({TL_NOTE_START}(?:[^()]|\([^()]*\))*\)', re.IGNORECASE)
+# A link in brackets, or on its own without the punctuation after it. Links may hold brackets: /wiki/Foo_(bar).
+URL = r'https?://(?:[^\s()]|\([^\s()]*\))*'
+LINK = re.compile(rf'\s*\(\s*{URL}\s*\)|\s*{URL}(?<![.,;:!?\'"”’])')
+# A footnote mark after a word or a sentence ("collapse. [1] Deals"), but not values such as "Strength [15]".
+FOOTNOTE_MARK = re.compile(r'(?<=[A-Za-z])\[\d{1,2}\]|(?<=[.,;:!?”"’)])\s*\[\d{1,2}\]')
+# The "[email protected]" placeholder some sites put in place of censored words, decorative symbols,
+# and tildes stretching a word ("Jack~~pot", "Oppa~"); ranges such as "Monday~Friday" stay.
+NOISE = re.compile(r'\[email(?:\s|\xa0)protected\]|[★☆■□▲△▼▽◆◇●○►◄▶◀※♥♡❤♪♫]\s*'
+                   r'|(?<=[a-z])~+(?=[a-z])|(?<=[A-Za-z])~+(?=[\s.,;:!?”"’]|$)')
+# A sentence that ends without a space before the next one ("neighborhood.Thanks", "Puk!Puk!"),
+# but not inside links or addresses ("www.Example.com", "site.com/novel.Chapter").
+RUN_ON_SENTENCE = re.compile(r'(?<![/\w])(?!www\.)([A-Za-z][a-z]+[.!?]+)(?=[A-Z][a-z])')
+
+def tidy_for_speech(element: BeautifulSoup, keep_notes: bool = False, keep_footnotes: bool = False) -> None:
+    """Remove text TTS should not read and add the missing space between run-on sentences.
+
+    Bracketed translator notes stay when notes are included; links and footnote marks stay when footnotes are.
+    """
+    removed = [NOISE] + ([] if keep_notes else [NOTE_IN_BRACKETS]) + ([] if keep_footnotes else [LINK, FOOTNOTE_MARK])
+    for text in _texts(element):
+        fixed = text
+        for pattern in removed:
+            fixed = pattern.sub('', fixed)
+        fixed = RUN_ON_SENTENCE.sub(r'\1 ', fixed)
+        if fixed != text:
+            text.replace_with(fixed)
+
+# A site's own name, which some sites add to the story as a watermark ("Search Example.com for the original").
+SITE_NAME = re.compile(r'\b[A-Z][\w-]*\.(?:com|net|org)\b')
+WATERMARK_WORDS = re.compile(r'\b(?:find us|search|the original|original source|on google|stolen|available on'
+                             r'|support us|quick look|great content)\b', re.IGNORECASE)
+# A site name added after the end of a sentence or a value: '“Are you going?” Example.com', 'Attack: 25,020 Example.com'.
+TRAILING_SITE_NAME = re.compile(r'(?<=[.!?…”"’\]\d])\s*' + SITE_NAME.pattern + r'\s*$')
+SEPARATOR_LINE = re.compile(r'^[\s*=_~#·•—–-]+$')
+
+def is_watermark(text: str) -> bool:
+    """True for a short paragraph that advertises a site, such as 'We are "Example.com", find us on google.'"""
+    rest = SITE_NAME.sub('', text)
+    return bool(SITE_NAME.search(text)) and len(text.split()) <= 15 and (
+        bool(WATERMARK_WORDS.search(rest)) or not re.search(r'[^\W\d_]', rest))
+
+def trim_paragraph(paragraph: BeautifulSoup) -> None:
+    """Drop a site name added after a paragraph's last sentence, and the spaces at its start and end."""
+    texts = _texts(paragraph)
+    for text in reversed(texts):
+        fixed = TRAILING_SITE_NAME.sub('', text).rstrip()
+        if fixed != text:
+            text.replace_with(fixed)
+        if fixed:
+            break
+    for text in _texts(paragraph):
+        fixed = text.lstrip()
+        if fixed != text:
+            text.replace_with(fixed)
+        if fixed:
+            break
+
+LOOSE_TAGS = {'em', 'i', 'strong', 'b', 'br', 'span', 'a', 'sup', 'u', 's', 'font'}
+
+def wrap_loose_text(content_div: BeautifulSoup) -> None:
+    """Put story text that sits outside any <p> into a paragraph of its own.
+
+    Text after the last paragraph is left out, as it is usually page scraps rather than story.
+    """
+    root = content_div.find(True)
+    if root is None:
+        return
+    children = [child for child in root.children if not isinstance(child, Comment)]
+    last_paragraph = max((i for i, child in enumerate(children) if getattr(child, 'name', None) == 'p'), default=-1)
+    run = []
+    for child in children[:last_paragraph + 1]:
+        if isinstance(child, NavigableString) or child.name in LOOSE_TAGS:
+            run.append(child)
+            continue
+        # Only runs with text of their own; a lone link or label, such as "Next Chapter", is not story.
+        if any(isinstance(part, NavigableString) and part.strip() for part in run):
+            paragraph = content_div.new_tag('p')
+            run[0].insert_before(paragraph)
+            for part in run:
+                paragraph.append(part.extract())
+        run = []
 
 def read_saved_chapters(location) -> List[Tuple[Union[int, float], BeautifulSoup]]:
     """Read chapters saved by browser/collect-chapters.js from one .html file, or every one in a folder, in chapter order."""
