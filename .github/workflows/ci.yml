@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Qt offscreen runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-3 libegl1 libfontconfig1 libgl1 libglib2.0-0 libpulse0 libpulse-mainloop-glib0 libxkbcommon0
+
+      - name: Install package and dev dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Lint with Ruff
+        run: ruff check .
+
+      - name: Run non-Qt tests
+        run: python -W default -W error::ResourceWarning -m unittest tests/test_jobs.py tests/test_saved_chapters.py tests/test_reliability.py tests/test_phase2_cli_and_modules.py -v
+
+      - name: Run full test suite (including offscreen GUI tests)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -W default -W error::ResourceWarning -m unittest discover -s tests -v
+
+      - name: Verify wheel build and bundled assets
+        run: |
+          python -m pip wheel --no-deps . -w dist-wheel
+          python -c "
+          from pathlib import Path
+          from zipfile import ZipFile
+          wheels = list(Path('dist-wheel').glob('*.whl'))
+          assert len(wheels) == 1, wheels
+          with ZipFile(wheels[0]) as z:
+              names = set(z.namelist())
+              for required in ('WebNovelScraper.py', 'WebNovelDesktop.py', 'webnovel/__init__.py', 'browser/collect-chapters.js', 'webnovel_assets/icon.ico', 'webnovel_assets/check.svg'):
+                  assert required in names, f'Missing {required} in {sorted(names)}'
+              assert not any(n.startswith(('tests/', 'webnovel_env/')) for n in names), sorted(names)
+          print('Wheel verified:', wheels[0].name, len(names), 'entries')
+          "

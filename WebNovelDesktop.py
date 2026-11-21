@@ -8,21 +8,21 @@ import sys
 from threading import Event, Thread
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, QObject, QSettings, QSize, Qt, QThread, QUrl, Signal, Slot, QStandardPaths
+from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QThread, QUrl, Signal, Slot, QStandardPaths
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPalette, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QProxyStyle, QPushButton, QScrollArea, QStyle, QSizePolicy, QSpinBox, QSplitter, QStackedWidget,
+    QProxyStyle, QPushButton, QScrollArea, QStyle, QSpinBox, QSplitter, QStackedWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QVBoxLayout, QWidget,
 )
 from PySide6.QtTextToSpeech import QTextToSpeech
 
-from desktop_service import (
-    JobSettings, browser_script, read_epub, run_job, site_blocks_app, site_selectors, split_novel_url,
+from webnovel import (
+    JobSettings, SiteBlocked, browser_script, read_epub, resource, run_job,
+    scan_saved_chapters, site_blocks_app, site_selectors, split_novel_url,
 )
-from WebNovelScraper import SiteBlocked, scan_saved_chapters
 
 
 STYLE = """
@@ -119,7 +119,7 @@ QToolTip { background: #233343; color: #f0f7f8; border: none; border-radius: 4px
 QStatusBar { background: #1f474d; color: #c9dfe2; border-top: 1px solid #2b5c62; padding: 1px 12px; font-size: 12px; }
 QStatusBar QLabel { background: transparent; color: #c9dfe2; }
 QStatusBar::item { border: none; }
-""".replace('__UI_ASSETS__', (Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / 'webnovel_assets').as_posix())
+""".replace('__UI_ASSETS__', resource('webnovel_assets').as_posix())
 
 
 class ModernStyle(QProxyStyle):
@@ -210,7 +210,7 @@ class DesktopWindow(QMainWindow):
         self.setWindowTitle('')
         self.resize(1180, 820)
         self.setMinimumSize(960, 690)
-        icon = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'icon.ico'
+        icon = resource('webnovel_assets', 'icon.ico')
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
         self.setStyleSheet(STYLE)
@@ -1362,8 +1362,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--cli':
         sys.argv.pop(1)
         from WebNovelScraper import main as cli_main
-        cli_main()
-        return 0
+        return cli_main()
     parser = argparse.ArgumentParser(description='Web Novel Scraper desktop workspace')
     parser.add_argument('--cli', action='store_true', help='Run the original command-line interface; put --cli before scraper options')
     parser.parse_args()

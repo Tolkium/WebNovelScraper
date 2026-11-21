@@ -18,29 +18,15 @@ An accessibility tool to help an individual blind person convert web novels into
 
 ## For Developers
 
-If you want to adapt this for a different site, you'll need to modify these parts in `WebNovelScraper.py`:
+If you want to adapt the scraper for a different website, the site defaults and content cleaning live in two focused modules:
 
-```python
-# 1. Content targeting (required) - in get_chapter_content():
-325  title_elem = soup.find('span', class_='chapter-title')  # Change this class
-332  content_div = soup.find('div', id='chapter-container')  # Change this ID
-
-# 2. Content cleaning (optional) - in _clean_html_content():
-202  selectors = [ 'script' ..... 'div[data-mobid]' ]  # Remove or modify list
-      
-# 3. Content processing (optional) - in _process_content():
-265 if text.startswith(('T/L:', 'T/N:'))  # Remove or modify translator notes at start
-271 elif text.startswith(tuple(str(i) + '.' for i in range(1, 10))) and ':' in text  # Remove or modify footnotes
-277 elif ('T/N:' in text or ..... self._is_note_or_message(text, p))  # Remove or modify end notes and messages
-226 ['translator\'s note',  ..... 'note'] # Remove or modify strong text patterns
-234 ['t/n:' ..... 'as always'] # Remove or modify regular text patterns
-
-```
+- **Site selectors & ad rules** — [webnovel/settings.py](webnovel/settings.py) (`SITE_PROFILES` and `DEFAULT_SITE_PROFILE`): add a `SiteProfile` entry with the site's domain, title selector, content selector, and optional strip selectors. Both the desktop app and CLI pick it up automatically.
+- **TTS cleaning & note filtering** — [webnovel/cleaning.py](webnovel/cleaning.py): pure HTML/text functions (`clean_html_content`, `repair_split_words`, `tidy_for_speech`, `extract_chapter_parts`, `parse_chapter_elements`) with no network or Qt dependencies.
 
 **Debug/Modify:**
 
 ```bash
-python WebNovelScraper.py --debug  # See all processing details
+python WebNovelScraper.py --debug  # Writes full raw HTML & cleaning decisions to scraper_detailed.log
 ```
 
 ## Intended Purpose
@@ -95,7 +81,7 @@ chmod +x run.sh
 ./run.sh
 ```
 
-The launch scripts create a local `webnovel_env` environment, install the dependencies there, and open the desktop app. Use the launch script each time to run with these dependencies. The first launch requires an internet connection to install dependencies.
+The launch scripts create a local `webnovel_env` environment, install the dependencies on first run (or whenever `requirements.txt` changes), and open the desktop app. Subsequent launches skip `pip` so the app starts quickly and works offline. Pass `--update` first (`run.bat --update`, `run.bat --update --cli`, or `./run.sh --update`) to upgrade dependencies manually.
 
 ## Usage
 
@@ -155,11 +141,21 @@ Command-line Options:
 - `--start`: First chapter number to download
 - `--end`: Last chapter number to download
 - `--title`: Novel title for the EPUB file
-- `--debug`: Enable debug mode
+- `--output-dir`: Directory where the EPUB will be written (default: current directory)
+- `--output`: Output EPUB filename or path (relative paths resolve under `--output-dir`)
+- `--overwrite`: Replace an existing EPUB file if present
+- `-y`, `--yes`: Skip interactive prompts and confirmation (for scripted runs)
+- `--language`: EPUB language code (default `en`)
+- `--debug`: Enable debug mode (writes `scraper_detailed.log` into the output directory)
 - `--cover-url`: Direct URL to cover image
 - `--author`: Author name
 - `--translator`: Translator name
 - `--creator`: Creator name
+- `--title-selector`: Custom CSS selector for the chapter title (overrides site defaults)
+- `--content-selector`: Custom CSS selector for the chapter content container (overrides site defaults)
+- `--requests-per-second`: Maximum requests per second (default `2.0`)
+- `--timeout`: Request timeout in seconds (default `30`)
+- `--retries`: Retry attempts per chapter for transient errors (default `3`)
 - `--simple-chapters`: Use simple chapter numbering
 - `--no-headings`: Leave chapter headings out of the text so text-to-speech goes straight into the story (chapter names stay in the table of contents)
 - `--include-footnotes`: Include footnotes in output
@@ -182,7 +178,7 @@ In the desktop app, the browser check is detected when you click **Use this URL*
 1. Fill in the source and chapter range, then click **Copy script**. The script is made for that book and range.
 2. Open a chapter page of the book in your browser, press `F12`, open **Console**, paste the script and press Enter.
 3. Confirm the first and last chapter in the popups. All chapters are saved to one file in Downloads.
-4. Click **Browse…**, choose the saved file and click **Review and create EPUB**.
+4. Click **Browse…** to choose a saved `.html` file—or **Folder…** to import a folder of saved chapter batches—and the chapter range fills in automatically. Then click **Review and create EPUB**.
 
 From the command line, paste `browser/collect-chapters.js` as it is on a chapter page whose address ends in the chapter number, move the saved files into `imports/` and build the EPUB:
 
@@ -214,19 +210,21 @@ chmod +x build_exe.sh
 ```
 project/
   ├── WebNovelDesktop.py            # Desktop interface
-  ├── desktop_service.py            # Background jobs and EPUB reading
-  ├── WebNovelScraper.py            # Scraper engine and original CLI
-  ├── requirements.txt              # Python dependencies
-  ├── setup.py                      # Package setup file
+  ├── WebNovelScraper.py            # Command-line interface
+  ├── webnovel/                     # Shared scraping, cleaning, EPUB, and job modules
+  ├── webnovel_assets/              # UI SVG icons and application icon (icon.ico)
+  ├── browser/collect-chapters.js   # Browser DevTools collector for blocked sites
+  ├── pyproject.toml                # Package metadata, optional extras, and Ruff config
+  ├── requirements.txt              # Runtime Python dependencies
   ├── build_exe.bat                 # Windows executable build script
   ├── build_exe.sh                  # Linux/Mac executable build script
-  ├── build.bat                     # Windows build script
-  ├── build.sh                      # Linux/Mac build script
-  ├── run.bat                       # Windows run script
-  ├── run.sh                        # Linux/Mac run script
-  ├── icon.ico                      # Application icon
+  ├── build.bat                     # Windows build wrapper
+  ├── build.sh                      # Linux/Mac build wrapper
+  ├── run.bat                       # Windows run script (offline-friendly after first run)
+  ├── run.sh                        # Linux/Mac run script (offline-friendly after first run)
   ├── WebNovelScraper.spec          # Desktop executable build configuration
-  ├── tests/                       # Local website and desktop integration tests
+  ├── tests/                        # Non-Qt service/cleaning tests and PySide6 GUI tests
+  ├── .github/workflows/ci.yml      # Ruff lint, unit/GUI tests, and wheel packaging CI
   ├── docs/screenshots/             # README screenshots
   ├── README.md                     # Documentation
   ├── .gitignore                    # Git ignore file
@@ -245,7 +243,19 @@ project/
 
 ## Development checks
 
-On Windows, run `.\webnovel_env\Scripts\python.exe -m unittest discover -s tests -v`. On Linux/Mac, use `webnovel_env/bin/python -m unittest discover -s tests -v`.
+Install the dev dependencies (`ruff`), then run the linter and full test suite (Windows):
+
+```powershell
+.\webnovel_env\Scripts\python.exe -m pip install -e ".[dev]"
+.\webnovel_env\Scripts\python.exe -m ruff check .
+.\webnovel_env\Scripts\python.exe -W default -W error::ResourceWarning -m unittest discover -s tests -v
+```
+
+On Linux/Mac, install with `webnovel_env/bin/python -m pip install -e '.[dev]'`, then run `webnovel_env/bin/python -m ruff check .` and `webnovel_env/bin/python -W default -W error::ResourceWarning -m unittest discover -s tests -v` (set `QT_QPA_PLATFORM=offscreen` on headless machines). To run only the non-Qt tests:
+
+```powershell
+.\webnovel_env\Scripts\python.exe -m unittest tests/test_jobs.py tests/test_saved_chapters.py tests/test_reliability.py tests/test_phase2_cli_and_modules.py -v
+```
 
 The tests use a local fixture website to verify the complete desktop job through chapter fetching, content options, cover processing, EPUB writing, preview, progress, saved settings, cancellation and failure handling. They do not download novels from external websites.
 
