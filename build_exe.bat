@@ -6,8 +6,9 @@ if not exist "webnovel_env\Scripts\python.exe" (
     python -m venv webnovel_env
     if errorlevel 1 goto build_error
 )
-"webnovel_env\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
+"webnovel_env\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt "pyinstaller>=6.0"
 if errorlevel 1 goto build_error
+copy /y requirements.txt "webnovel_env\.requirements.installed" >nul
 set "PYINSTALLER_CONFIG_DIR=%CD%\build\pyinstaller-cache"
 "webnovel_env\Scripts\python.exe" -m PyInstaller --clean --noconfirm WebNovelScraper.spec
 if errorlevel 1 goto build_error

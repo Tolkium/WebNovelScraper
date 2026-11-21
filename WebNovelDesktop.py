@@ -8,13 +8,13 @@ import sys
 from threading import Event, Thread
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, QObject, QSettings, QSize, Qt, QThread, QUrl, Signal, Slot, QStandardPaths
+from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QThread, QUrl, Signal, Slot, QStandardPaths
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPalette, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QProxyStyle, QPushButton, QScrollArea, QStyle, QSizePolicy, QSpinBox, QSplitter, QStackedWidget,
+    QProxyStyle, QPushButton, QScrollArea, QStyle, QSpinBox, QSplitter, QStackedWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QVBoxLayout, QWidget,
 )
 from PySide6.QtTextToSpeech import QTextToSpeech
@@ -210,7 +210,7 @@ class DesktopWindow(QMainWindow):
         self.setWindowTitle('')
         self.resize(1180, 820)
         self.setMinimumSize(960, 690)
-        icon = resource('icon.ico')
+        icon = resource('webnovel_assets', 'icon.ico')
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
         self.setStyleSheet(STYLE)

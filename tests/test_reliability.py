@@ -12,7 +12,6 @@ from threading import Event, Thread
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
-from zipfile import ZipFile
 
 from bs4 import BeautifulSoup
 from ebooklib import epub

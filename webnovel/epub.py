@@ -120,13 +120,13 @@ class EpubCreator:
 
     def _add_styling(self) -> None:
         style = """
-            body { 
-                font-family: Times New Roman, serif; 
-                margin: 5%; 
-                text-align: justify; 
+            body {
+                font-family: Times New Roman, serif;
+                margin: 5%;
+                text-align: justify;
             }
-            h1 { 
-                text-align: center; 
+            h1 {
+                text-align: center;
                 font-size: 2em;
                 margin: 1em 0 2em 0;
             }

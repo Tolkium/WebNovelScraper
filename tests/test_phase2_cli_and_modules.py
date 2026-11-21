@@ -3,7 +3,6 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
-import sys
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
@@ -238,7 +237,7 @@ class Phase2CliAndModulesTests(unittest.TestCase):
 
         self.assertTrue(resource('browser', 'collect-chapters.js').is_file())
         self.assertTrue(resource('webnovel_assets', 'check.svg').is_file())
-        self.assertTrue(resource('icon.ico').is_file())
+        self.assertTrue(resource('webnovel_assets', 'icon.ico').is_file())
 
     def test_relative_output_respects_output_dir_and_reserved_windows_names_are_caught(self):
         with TemporaryDirectory() as tmp:
