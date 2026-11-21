@@ -17,21 +17,22 @@ from zipfile import ZipFile
 from bs4 import BeautifulSoup
 from ebooklib import epub
 
-from desktop_service import JobSettings, _extract_readable_text, read_epub, run_job
-from WebNovelScraper import (
-    Config,
+from webnovel import (
     EpubCreator,
+    JobSettings,
     RateLimiter,
     ScraperCancelled,
-    ScraperConstants,
     SiteBlocked,
     WebNovelScraper,
     is_browser_check,
     load_saved_chapters,
-    main as cli_main,
     parse_retry_after,
+    read_epub,
+    run_job,
     scan_saved_chapters,
 )
+from webnovel.epub import _extract_readable_text
+from WebNovelScraper import main as cli_main
 
 
 STORY_BODY = '<p>' + 'The hero forged a legendary sword in the quiet smithy. ' * 5 + '</p>'
@@ -184,8 +185,8 @@ class RateLimiterAndRetryTests(unittest.TestCase):
         self.assertEqual(limiter.retry_delay(0, retry_after=999.0), 300.0)
 
         cancel = Event()
-        constants = ScraperConstants(MAX_RETRIES=3, DEFAULT_REQUESTS_PER_SECOND=100.0)
-        with WebNovelScraper(constants=constants, cancel_event=cancel) as scraper:
+        settings = JobSettings(retries=3, requests_per_second=100.0)
+        with WebNovelScraper(settings=settings, cancel_event=cancel) as scraper:
             original_sleep = scraper.rate_limiter.sleep
 
             def cancel_when_sleeping(seconds):
@@ -198,8 +199,8 @@ class RateLimiterAndRetryTests(unittest.TestCase):
                 scraper.get_chapter_content(f'{self.base}/rate-limited/chapter-1')
 
     def test_408_and_500_retry_while_400_401_410_and_unexpected_parse_errors_fail_once(self):
-        constants = ScraperConstants(MAX_RETRIES=3, DEFAULT_REQUESTS_PER_SECOND=100.0)
-        with WebNovelScraper(constants=constants) as scraper:
+        settings = JobSettings(retries=3, requests_per_second=100.0)
+        with WebNovelScraper(settings=settings) as scraper:
             scraper.rate_limiter.sleep = lambda s: None
             self.assertEqual(scraper.get_chapter_content(f'{self.base}/status-408/chapter-1')[0], 'Recovered 408')
             self.assertEqual(RetryFixtureHandler.counts['/status-408/chapter-1'], 2)
@@ -226,9 +227,9 @@ class RateLimiterAndRetryTests(unittest.TestCase):
         self.assertTrue(is_browser_check(mitigated))
 
     def test_404_and_parse_errors_fail_immediately_without_retries_or_compounding_backoff(self):
-        constants = ScraperConstants(MAX_RETRIES=3, DEFAULT_REQUESTS_PER_SECOND=100.0)
+        settings = JobSettings(retries=3, requests_per_second=100.0)
         sleeps = []
-        with WebNovelScraper(constants=constants) as scraper:
+        with WebNovelScraper(settings=settings) as scraper:
             original_sleep = scraper.rate_limiter.sleep
 
             def record_sleep(seconds):
@@ -249,8 +250,8 @@ class RateLimiterAndRetryTests(unittest.TestCase):
         self.assertEqual(sleeps, [])
 
     def test_cloudflare_503_outage_retries_and_recovers_while_challenge_raises(self):
-        constants = ScraperConstants(MAX_RETRIES=3, DEFAULT_REQUESTS_PER_SECOND=100.0)
-        with WebNovelScraper(constants=constants) as scraper:
+        settings = JobSettings(retries=3, requests_per_second=100.0)
+        with WebNovelScraper(settings=settings) as scraper:
             scraper.rate_limiter.sleep = lambda s: None
             title, content, _, _ = scraper.get_chapter_content(f'{self.base}/cf-503-outage/chapter-1')
             self.assertEqual(title, 'Recovered 503')
@@ -262,9 +263,9 @@ class RateLimiterAndRetryTests(unittest.TestCase):
             self.assertEqual(RetryFixtureHandler.counts['/cf-503-challenge/chapter-1'], 1)
 
     def test_429_honors_retry_after_header_and_recovers(self):
-        constants = ScraperConstants(MAX_RETRIES=3, DEFAULT_REQUESTS_PER_SECOND=100.0)
+        settings = JobSettings(retries=3, requests_per_second=100.0)
         sleeps = []
-        with WebNovelScraper(constants=constants) as scraper:
+        with WebNovelScraper(settings=settings) as scraper:
             scraper.rate_limiter.sleep = lambda s: sleeps.append(s) if s > 0 else None
             title, _, _, _ = scraper.get_chapter_content(f'{self.base}/rate-limited/chapter-1')
             self.assertEqual(title, 'Recovered 429')
@@ -287,7 +288,7 @@ class RateLimiterAndRetryTests(unittest.TestCase):
 
 class FootnoteXhtmlAndReaderTests(unittest.TestCase):
     def test_footnotes_are_escaped_valid_xhtml_and_number_is_not_duplicated(self):
-        creator = EpubCreator('Test', settings=Config(INCLUDE_FOOTNOTES=True))
+        creator = EpubCreator('Test', settings=JobSettings(include_footnotes=True))
         chapter = creator.add_chapter(
             {
                 'title': 'Chapter 1',
@@ -318,7 +319,7 @@ class FootnoteXhtmlAndReaderTests(unittest.TestCase):
         )
         # Footnotes ON
         soup_on = BeautifulSoup(html, 'html.parser')
-        with WebNovelScraper(settings=Config(INCLUDE_FOOTNOTES=True)) as scraper:
+        with WebNovelScraper(settings=JobSettings(include_footnotes=True)) as scraper:
             _, content_on, _, footnotes = scraper.parse_chapter(
                 soup_on.select_one('.chapter-title'), soup_on.select_one('#chapter-container'), '1'
             )
@@ -329,7 +330,7 @@ class FootnoteXhtmlAndReaderTests(unittest.TestCase):
 
         # Footnotes OFF: removes multiline <sup class="fn">10</sup> but keeps 1<sup>st</sup> and numbered story lines.
         soup_off = BeautifulSoup(html, 'html.parser')
-        with WebNovelScraper(settings=Config(INCLUDE_FOOTNOTES=False)) as scraper:
+        with WebNovelScraper(settings=JobSettings(include_footnotes=False)) as scraper:
             _, content_off, _, _ = scraper.parse_chapter(
                 soup_off.select_one('.chapter-title'), soup_off.select_one('#chapter-container'), '1'
             )
@@ -355,7 +356,7 @@ class FootnoteXhtmlAndReaderTests(unittest.TestCase):
             + '</div>'
         )
         soup_on = BeautifulSoup(html, 'html.parser')
-        with WebNovelScraper(settings=Config(INCLUDE_FOOTNOTES=True)) as scraper:
+        with WebNovelScraper(settings=JobSettings(include_footnotes=True)) as scraper:
             _, content_on, _, footnotes = scraper.parse_chapter(
                 soup_on.select_one('.chapter-title'), soup_on.select_one('#chapter-container'), '1'
             )
@@ -373,14 +374,14 @@ class FootnoteXhtmlAndReaderTests(unittest.TestCase):
         self.assertEqual(content_on.count('id="ref-1"'), 1)
         self.assertEqual(content_on.count('href="#footnote-1"'), 2)
         self.assertIn('id="ref-3"', content_on)
-        creator = EpubCreator('FnTest', settings=Config(INCLUDE_FOOTNOTES=True))
+        creator = EpubCreator('FnTest', settings=JobSettings(include_footnotes=True))
         chap = creator.add_chapter({'title': 'Ch 1', 'content': content_on, 'notes': [], 'footnotes': footnotes}, 1)
         self.assertIn('href="#ref-1"', chap.content)
         self.assertIn('href="#ref-3"', chap.content)
         self.assertNotIn('href="#ref-4"', chap.content)
 
         soup_off = BeautifulSoup(html, 'html.parser')
-        with WebNovelScraper(settings=Config(INCLUDE_FOOTNOTES=False)) as scraper:
+        with WebNovelScraper(settings=JobSettings(include_footnotes=False)) as scraper:
             _, content_off, _, _ = scraper.parse_chapter(
                 soup_off.select_one('.chapter-title'), soup_off.select_one('#chapter-container'), '1'
             )
@@ -395,7 +396,7 @@ class FootnoteXhtmlAndReaderTests(unittest.TestCase):
     def test_reader_preserves_inline_formatting_and_non_p_structures_for_tts(self):
         with TemporaryDirectory() as tmp:
             epub_path = Path(tmp) / 'tts_reader.epub'
-            creator = EpubCreator('TTS Book', settings=Config(CHAPTER_HEADINGS=True))
+            creator = EpubCreator('TTS Book', settings=JobSettings(chapter_headings=True))
             ch = creator.add_chapter(
                 {
                     'title': 'Chapter 1',
@@ -500,11 +501,7 @@ class FootnoteXhtmlAndReaderTests(unittest.TestCase):
             os.chdir(root)
             try:
                 with patch('sys.argv', ['WebNovelScraper.py', '--from-folder', str(batch_a), '--title', 'Same Name', '--simple-chapters']), \
-                        patch('builtins.input', return_value=''), \
-                        patch.object(Config, 'SIMPLE_CHAPTER_NAMES', Config.SIMPLE_CHAPTER_NAMES), \
-                        patch.object(Config, 'INCLUDE_FOOTNOTES', Config.INCLUDE_FOOTNOTES), \
-                        patch.object(Config, 'INCLUDE_CHAPTER_NOTES', Config.INCLUDE_CHAPTER_NOTES), \
-                        patch.object(Config, 'CHAPTER_HEADINGS', Config.CHAPTER_HEADINGS):
+                        patch('builtins.input', return_value=''):
                     cli_main()
             finally:
                 os.chdir(prev_cwd)

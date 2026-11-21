@@ -10,8 +10,8 @@ from zipfile import ZipFile
 
 from bs4 import BeautifulSoup
 
-from desktop_service import JobSettings, read_epub, run_job
-from WebNovelScraper import Config, WebNovelScraper, main, read_saved_chapters, repair_split_words
+from webnovel import JobSettings, WebNovelScraper, read_epub, read_saved_chapters, repair_split_words, run_job
+from WebNovelScraper import main
 
 
 def saved_file(*chapters):
@@ -75,7 +75,7 @@ class SpeechCleanupTests(unittest.TestCase):
         self.scraper = self.make_scraper()
 
     def make_scraper(self, **settings):
-        scraper = WebNovelScraper(settings=Config(**settings), log_path=Path(self.temp.name) / f'{len(settings)}.log')
+        scraper = WebNovelScraper(settings=JobSettings(**settings), log_path=Path(self.temp.name) / f'{len(settings)}.log')
         self.addCleanup(scraper.close)
         return scraper
 
@@ -121,7 +121,7 @@ class SpeechCleanupTests(unittest.TestCase):
                          ['“Fuc*…!!”', 'He was a Koryoin who grew up poor.', 'Inflicts collapse. Deals 600% damage.'])
 
     def test_footnote_marks_stay_when_footnotes_are_included(self):
-        self.assertEqual(self.paragraphs('<p>Inflicts collapse. [1] Deals damage.</p>', self.make_scraper(INCLUDE_FOOTNOTES=True)),
+        self.assertEqual(self.paragraphs('<p>Inflicts collapse. [1] Deals damage.</p>', self.make_scraper(include_footnotes=True)),
                          ['Inflicts collapse. [1] Deals damage.'])
 
     def test_symbols_separators_and_tildes_are_removed(self):
@@ -137,7 +137,7 @@ class SpeechCleanupTests(unittest.TestCase):
     def test_stat_values_ranges_and_addresses_are_kept(self):
         self.assertEqual(self.paragraphs('<p>Strength [15] Agility [12]</p><p>Open Monday~Friday.</p>'),
                          ['Strength [15] Agility [12]', 'Open Monday~Friday.'])
-        self.assertEqual(self.paragraphs('<p>Visit www.Example.com today.</p>', self.make_scraper(INCLUDE_FOOTNOTES=True)),
+        self.assertEqual(self.paragraphs('<p>Visit www.Example.com today.</p>', self.make_scraper(include_footnotes=True)),
                          ['Visit www.Example.com today.'])
 
     def test_links_go_without_taking_punctuation(self):
@@ -153,7 +153,7 @@ class SpeechCleanupTests(unittest.TestCase):
                          ['“Oppa!”'])
 
     def test_included_notes_and_footnotes_keep_their_text(self):
-        scraper = self.make_scraper(INCLUDE_CHAPTER_NOTES=True, INCLUDE_FOOTNOTES=True)
+        scraper = self.make_scraper(include_notes=True, include_footnotes=True)
         self.assertEqual(self.paragraphs('<p>He was a Koryoin (https://en.wikipedia.org/wiki/Koryo-saram).</p>'
                                          '<p>“Oppa!” (TL: older brother)</p>', scraper),
                          ['He was a Koryoin (https://en.wikipedia.org/wiki/Koryo-saram).'])
@@ -195,7 +195,7 @@ class SavedChapterTests(unittest.TestCase):
         (self.folder / 'novel.html').write_text(saved_file((770, STORY), (769.1, STORY), (769, STORY)), encoding='utf-8')
         chapters = read_saved_chapters(self.folder)
         self.assertEqual([number for number, _ in chapters], [769, 769.1, 770])
-        with WebNovelScraper(settings=Config(SIMPLE_CHAPTER_NAMES=True)) as scraper:
+        with WebNovelScraper(settings=JobSettings(simple_chapters=True)) as scraper:
             number, section = chapters[1]
             self.assertEqual(scraper.parse_saved_chapter(section, number)[0], 'Chapter 769.1')
 
@@ -261,8 +261,7 @@ class SavedChapterTests(unittest.TestCase):
         previous = os.getcwd()
         os.chdir(self.folder)
         try:
-            with patch('sys.argv', argv), patch('builtins.input', return_value=''), \
-                    patch.object(Config, 'CHAPTER_HEADINGS', Config.CHAPTER_HEADINGS):
+            with patch('sys.argv', argv), patch('builtins.input', return_value=''):
                 main()
         finally:
             os.chdir(previous)

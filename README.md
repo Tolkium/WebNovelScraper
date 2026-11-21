@@ -214,8 +214,8 @@ chmod +x build_exe.sh
 ```
 project/
   ├── WebNovelDesktop.py            # Desktop interface
-  ├── desktop_service.py            # Background jobs and EPUB reading
-  ├── WebNovelScraper.py            # Scraper engine and original CLI
+  ├── WebNovelScraper.py            # Command-line interface
+  ├── webnovel/                     # Shared scraping, cleaning, EPUB, and job modules
   ├── requirements.txt              # Python dependencies
   ├── setup.py                      # Package setup file
   ├── build_exe.bat                 # Windows executable build script

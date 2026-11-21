@@ -18,9 +18,12 @@ from PySide6.QtCore import QSettings
 from PySide6.QtQml import QJSEngine
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from desktop_service import JobSettings, browser_script, read_epub, run_job, split_novel_url
+from webnovel import (
+    JobSettings, RateLimiter, ScraperCancelled, SiteBlocked,
+    browser_script, read_epub, run_job, split_novel_url,
+)
 from WebNovelDesktop import DesktopWindow
-from WebNovelScraper import RateLimiter, ScraperCancelled, SiteBlocked, parse_arguments
+from WebNovelScraper import parse_arguments
 
 
 class FixtureWebsite(BaseHTTPRequestHandler):
@@ -182,7 +185,7 @@ class DesktopTests(unittest.TestCase):
         self.assertFalse(self.settings.output_path.exists())
 
     def test_output_folder_without_hard_link_support(self):
-        with patch('desktop_service.os.link', side_effect=OSError('Hard links unavailable')):
+        with patch('webnovel.jobs.os.link', side_effect=OSError('Hard links unavailable')):
             result = self.job()
         self.assertIsNone(ZipFile(result.path).testzip())
         self.assertEqual(list(self.root.glob('.webnovel-*')), [])
