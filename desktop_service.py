@@ -14,12 +14,14 @@ import tempfile
 import shutil
 
 from bs4 import BeautifulSoup
+from bs4.element import NavigableString
 from ebooklib import epub, ITEM_DOCUMENT
 import requests
 import soupsieve
 
 from WebNovelScraper import (
-    Config, EpubCreator, ScraperCancelled, ScraperConstants, WebNovelScraper, is_browser_check, read_saved_chapters,
+    Config, EpubCreator, ScraperCancelled, ScraperConstants, WebNovelScraper,
+    build_epub_identifier, is_browser_check, load_saved_chapters,
 )
 
 
@@ -232,6 +234,21 @@ class JobResult:
     cancelled: bool = False
 
 
+def _epub_identifier(settings: JobSettings, loaded_saved=None, saved=None) -> str:
+    """Return a deterministic UUID unique to this book's source and effective chapter bounds."""
+    if settings.saved_file:
+        if loaded_saved is not None and loaded_saved.sources:
+            source = ','.join(loaded_saved.sources)
+        else:
+            source = str(Path(settings.saved_file).expanduser().resolve())
+        first = saved[0].raw_number if saved else settings.start
+        last = saved[-1].raw_number if saved else settings.end
+    else:
+        source = f'{settings.base_url.rstrip("/")}/{settings.novel_id.strip()}/{settings.chapter_prefix}'
+        first, last = settings.start, settings.end
+    return build_epub_identifier(settings.title, source, first, last)
+
+
 def run_job(settings: JobSettings, cancel: Event, log: Callable,
             progress: Callable, log_path: Path, overwrite=False):
     errors = settings.validate()
@@ -241,111 +258,186 @@ def run_job(settings: JobSettings, cancel: Event, log: Callable,
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() and not overwrite:
         raise FileExistsError(f'{output.name} already exists. Choose another filename.')
+    loaded_saved = None
+    saved = []
+    missing_majors = []
     if settings.saved_file:
-        saved = [(number, section) for number, section in read_saved_chapters(settings.saved_file)
-                 if settings.start <= number <= settings.end]
+        loaded_saved = load_saved_chapters(settings.saved_file)
+        saved = [ch for ch in loaded_saved.chapters if settings.start <= ch.major <= settings.end]
         if not saved:
             raise ValueError(f'No saved chapters {settings.start} to {settings.end} in {Path(settings.saved_file).name}. '
                              'Check the chapter range or choose another file.')
+        present_majors = {ch.major for ch in saved}
+        missing_majors = [n for n in range(settings.start, settings.end + 1) if n not in present_majors]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     config = settings.config()
-    scraper = WebNovelScraper(settings.debug, settings=config, constants=settings.constants(),
-                              cancel_event=cancel, log_callback=log, log_path=log_path)
     chapters, failed = [], []
-    if settings.saved_file:
-        sources = [(number, f'saved chapter {number}', partial(scraper.parse_saved_chapter, section, number))
-                   for number, section in saved]
-    else:
-        sources = []
-        for number in range(settings.start, settings.end + 1):
-            url = f'{settings.base_url.rstrip("/")}/{settings.novel_id.strip()}/{settings.chapter_prefix}{number}'
-            sources.append((number, url, partial(scraper.get_chapter_content, url)))
-    total = len(sources)
     temp_path = None
 
     def check_cancel():
         if cancel.is_set():
             raise ScraperCancelled()
 
-    try:
-        check_cancel()
-        creator = EpubCreator(settings.title.strip(), author=settings.author.strip(),
-                              translator=settings.translator.strip(), created_by=settings.creator.strip(),
-                              settings=config, language=settings.language)
-        if settings.cover_url.strip():
-            log('Loading and optimizing the cover image…')
-            cover = scraper.get_cover_image(settings.cover_url.strip())
-            check_cancel()
-            if cover:
-                creator.add_cover(cover)
-            else:
-                log('Warning: the cover could not be loaded. Continuing without a cover.')
-        log(f'Creating “{settings.title}” — {total} chapters requested.')
-        for index, (number, source, load) in enumerate(sources):
-            check_cancel()
-            progress({'stage': 'fetching', 'number': number, 'current': index,
-                      'total': total, 'success': len(chapters), 'failed': len(failed), 'title': source})
-            title, content, notes, footnotes = load()
-            check_cancel()
-            if title and content:
-                chapters.append({'title': title, 'content': content, 'notes': notes or [], 'footnotes': footnotes or {}})
-                # Simple names only repeat the number; the word count shows a chapter that came through short.
-                heading = f'Chapter {number}' if title == f'Chapter {number}' else f'Chapter {number}: {title}'
-                log(f'{heading} — {len(BeautifulSoup(content, "html.parser").get_text().split()):,} words')
-            elif settings.saved_file:
-                failed.append(number)
-                log(f'Warning: saved chapter {number} has no usable text.')
-            else:
-                failed.append(number)
-                log(f'Warning: chapter {number} failed after {settings.retries} attempts.')
-            progress({'stage': 'downloaded' if title and content else 'failed', 'number': number,
-                      'current': index + 1, 'total': total,
-                      'success': len(chapters), 'failed': len(failed), 'title': title or 'Could not download'})
-        if not chapters:
-            raise ValueError('No chapters could be downloaded. Check the novel URL and Advanced page selectors. See Activity for details.')
-        check_cancel()
-        log('Building the EPUB, navigation and reading styles…')
-        epub_chapters = []
-        for index, chapter in enumerate(chapters, 1):
-            check_cancel()
-            epub_chapters.append(creator.add_chapter(chapter, index))
-        creator.finalize(epub_chapters)
-        fd, temporary = tempfile.mkstemp(prefix='.webnovel-', suffix='.epub', dir=output.parent)
-        os.close(fd)
-        temp_path = Path(temporary)
-        if epub.write_epub(str(temp_path), creator.book, {}) is False:
-            raise IOError('The EPUB could not be written.')
-        check_cancel()
-        if overwrite:
-            os.replace(temp_path, output)
+    with WebNovelScraper(settings.debug, settings=config, constants=settings.constants(),
+                         cancel_event=cancel, log_callback=log, log_path=log_path) as scraper:
+        if settings.saved_file and loaded_saved is not None:
+            if len(loaded_saved.sources) > 1:
+                log(f'Warning: saved folder contains chapters from {len(loaded_saved.sources)} different sources: '
+                    f'{", ".join(loaded_saved.sources)}.')
+            if loaded_saved.duplicates:
+                dup_list = ', '.join(loaded_saved.duplicates[:10])
+                more = f' (+{len(loaded_saved.duplicates) - 10} more)' if len(loaded_saved.duplicates) > 10 else ''
+                log(f'Warning: duplicate saved chapters found ({dup_list}{more}); kept the longest version of each.')
+            if loaded_saved.invalid_count:
+                log(f'Warning: skipped {loaded_saved.invalid_count} saved chapter section(s) with invalid chapter numbers.')
+            entries = [
+                (ch.key, ch.raw_number, f'saved chapter {ch.raw_number}',
+                 partial(scraper.parse_saved_chapter, ch.section, ch.raw_number))
+                for ch in saved
+            ]
+            for missing_num in missing_majors:
+                entries.append(((missing_num,), missing_num, f'saved chapter {missing_num}', None))
+            entries.sort(key=lambda item: item[0])
+            sources = [(num, src, loader) for _, num, src, loader in entries]
         else:
-            # Exclusive creation also protects against another process creating the file mid-job.
-            try:
-                os.link(temp_path, output)
-            except FileExistsError:
-                raise
-            except OSError:
-                # FAT volumes and some network shares do not support hard links.
-                created = False
+            sources = []
+            for number in range(settings.start, settings.end + 1):
+                url = f'{settings.base_url.rstrip("/")}/{settings.novel_id.strip()}/{settings.chapter_prefix}{number}'
+                sources.append((number, url, partial(scraper.get_chapter_content, url)))
+        total = len(sources)
+
+        try:
+            check_cancel()
+            creator = EpubCreator(settings.title.strip(), author=settings.author.strip(),
+                                  translator=settings.translator.strip(), created_by=settings.creator.strip(),
+                                  settings=config, language=settings.language,
+                                  identifier=_epub_identifier(settings, loaded_saved, saved))
+            if settings.cover_url.strip():
+                log('Loading and optimizing the cover image…')
+                cover = scraper.get_cover_image(settings.cover_url.strip())
+                check_cancel()
+                if cover:
+                    creator.add_cover(cover)
+                else:
+                    log('Warning: the cover could not be loaded. Continuing without a cover.')
+            log(f'Creating “{settings.title}” — {total} chapters requested.')
+            for index, (number, source, load) in enumerate(sources):
+                check_cancel()
+                progress({'stage': 'fetching', 'number': number, 'current': index,
+                          'total': total, 'success': len(chapters), 'failed': len(failed), 'title': source})
+                if load is None:
+                    failed.append(number)
+                    log(f'Warning: saved chapter {number} is missing from {Path(settings.saved_file).name}.')
+                    progress({'stage': 'failed', 'number': number,
+                              'current': index + 1, 'total': total,
+                              'success': len(chapters), 'failed': len(failed), 'title': 'Missing from saved file'})
+                    continue
+                title, content, notes, footnotes = load()
+                check_cancel()
+                if title and content:
+                    chapters.append({'title': title, 'content': content, 'notes': notes or [], 'footnotes': footnotes or {}})
+                    # Simple names only repeat the number; the word count shows a chapter that came through short.
+                    heading = f'Chapter {number}' if title == f'Chapter {number}' else f'Chapter {number}: {title}'
+                    log(f'{heading} — {len(BeautifulSoup(content, "html.parser").get_text().split()):,} words')
+                elif settings.saved_file:
+                    failed.append(number)
+                    log(f'Warning: saved chapter {number} has no usable text.')
+                else:
+                    failed.append(number)
+                    log(f'Warning: chapter {number} failed after {settings.retries} attempts.')
+                progress({'stage': 'downloaded' if title and content else 'failed', 'number': number,
+                          'current': index + 1, 'total': total,
+                          'success': len(chapters), 'failed': len(failed), 'title': title or 'Could not download'})
+            if not chapters:
+                raise ValueError('No chapters could be downloaded. Check the novel URL and Advanced page selectors. See Activity for details.')
+            check_cancel()
+            log('Building the EPUB, navigation and reading styles…')
+            epub_chapters = []
+            for index, chapter in enumerate(chapters, 1):
+                check_cancel()
+                epub_chapters.append(creator.add_chapter(chapter, index))
+            creator.finalize(epub_chapters)
+            fd, temporary = tempfile.mkstemp(prefix='.webnovel-', suffix='.epub', dir=output.parent)
+            os.close(fd)
+            temp_path = Path(temporary)
+            if epub.write_epub(str(temp_path), creator.book, {}) is False:
+                raise IOError('The EPUB could not be written.')
+            check_cancel()
+            if overwrite:
+                os.replace(temp_path, output)
+            else:
+                # Exclusive creation also protects against another process creating the file mid-job.
                 try:
-                    with output.open('xb') as target, temp_path.open('rb') as source:
-                        created = True
-                        shutil.copyfileobj(source, target)
-                except Exception:
-                    if created:
-                        output.unlink(missing_ok=True)
+                    os.link(temp_path, output)
+                except FileExistsError:
                     raise
-            temp_path.unlink()
-        temp_path = None
-        log(f'Saved {output}. {len(chapters)} chapters included; {len(failed)} failed.')
-        return JobResult(output, len(chapters), failed)
-    except ScraperCancelled:
-        log('Cancelled. No EPUB was saved; existing files were left unchanged.')
-        return JobResult(None, len(chapters), failed, cancelled=True)
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-        scraper.close()
+                except OSError:
+                    # FAT volumes and some network shares do not support hard links.
+                    created = False
+                    try:
+                        with output.open('xb') as target, temp_path.open('rb') as source:
+                            created = True
+                            shutil.copyfileobj(source, target)
+                    except Exception:
+                        if created:
+                            output.unlink(missing_ok=True)
+                        raise
+                temp_path.unlink()
+            temp_path = None
+            log(f'Saved {output}. {len(chapters)} chapters included; {len(failed)} failed.')
+            return JobResult(output, len(chapters), failed)
+        except ScraperCancelled:
+            log('Cancelled. No EPUB was saved; existing files were left unchanged.')
+            return JobResult(None, len(chapters), failed, cancelled=True)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+
+INLINE_HTML_TAGS = {
+    'a', 'abbr', 'b', 'bdi', 'bdo', 'cite', 'code', 'data', 'del', 'dfn', 'em',
+    'font', 'i', 'ins', 'kbd', 'mark', 'q', 's', 'samp', 'small', 'span',
+    'strong', 'sub', 'sup', 'time', 'u', 'var', 'wbr',
+}
+
+
+def _extract_readable_text(body) -> str:
+    """Extract chapter text in document order, preserving paragraphs without breaking inline tags for TTS."""
+    paragraphs = []
+    run = []
+
+    def flush():
+        if not run:
+            return
+        raw = ''.join(run)
+        run.clear()
+        lines = [re.sub(r'[ \t]+', ' ', part).strip() for part in raw.splitlines()]
+        text = '\n'.join(part for part in lines if part)
+        if text:
+            paragraphs.append(text)
+
+    def walk(node):
+        for child in getattr(node, 'children', ()):
+            name = getattr(child, 'name', None)
+            if name is None:
+                if type(child) is not NavigableString:
+                    continue
+                # In HTML, source-code newlines inside a paragraph are normal spaces; only <br> breaks lines.
+                run.append(re.sub(r'\s+', ' ', str(child)))
+            elif name == 'br':
+                run.append('\n')
+            elif name == 'hr':
+                flush()
+            elif name in INLINE_HTML_TAGS:
+                walk(child)
+            else:
+                flush()
+                walk(child)
+                flush()
+
+    walk(body)
+    flush()
+    return '\n\n'.join(paragraphs)
 
 
 def read_epub(path):
@@ -365,7 +457,7 @@ def read_epub(path):
         heading = soup.find(['h1', 'h2', 'h3']) or soup.title
         name = heading.get_text(' ', strip=True) if heading and heading.get_text(strip=True) else item.get_name()
         body = soup.body or soup
-        text = body.get_text('\n', strip=True)
+        text = _extract_readable_text(body)
         if text:
             chapters.append((name, text))
     if not chapters:

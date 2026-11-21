@@ -1,20 +1,22 @@
 import requests
 from bs4 import BeautifulSoup
 from ebooklib import epub
-from datetime import datetime
-from collections import deque
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import logging
 import time
 import re
-from typing import Optional, Tuple, List, Dict, TypedDict, Union
+import uuid
+from typing import Optional, Tuple, List, Dict, Set, TypedDict, Union
 from bs4.element import Comment, NavigableString
 import os
 from PIL import Image
 from io import BytesIO
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 from html import escape
+from html.parser import HTMLParser
 from pathlib import Path
 import sys
 
@@ -29,7 +31,7 @@ class ScraperConstants:
     DEFAULT_TIMEOUT: int = 30
     MAX_RETRIES: int = 3
     MIN_CONTENT_LENGTH: int = 100
-    DEFAULT_REQUESTS_PER_SECOND: float = 20.0
+    DEFAULT_REQUESTS_PER_SECOND: float = 2.0
     MAX_COVER_HEIGHT: int = 2400
     COVER_ASPECT_RATIO: float = 2/3
     TITLE_SELECTOR: str = 'span.chapter-title'
@@ -64,6 +66,12 @@ NOTE_TEXT = re.compile(
     rf'\b{TL_NOTE_START}|\btranslator[\'’]?s? note\b|\bchapter note(?:\s*:|\s+by\b)'
     r'|\bthanks for playing\b|^as always,? (?:thanks|thank you|enjoy)'
     r'|\bglossary of common\b|\bglossary link\b|\bcurrent schedule:|\bcheck out my patreon\b', re.IGNORECASE)
+FOOTNOTE_LINE = re.compile(r'^(\d{1,2})\.(?!\d)\s*(.+)$')
+LABELED_FOOTNOTE = re.compile(
+    rf'^(\d{{1,2}})\.\s*(?:footnote\s*:|{TL_NOTE_START}|translator[\'’]?s?\s*note\s*:)',
+    re.IGNORECASE,
+)
+FOOTNOTE_SUP = re.compile(r'^\[?(\d{1,3})\]?$|^\*+$')
 
 class ValidationError(Exception):
     """Custom exception for validation errors."""
@@ -71,6 +79,10 @@ class ValidationError(Exception):
 
 class ScraperError(Exception):
     """Custom exception for scraper-specific errors."""
+    pass
+
+class _RetryableFetchError(Exception):
+    """Transient fetch issue (such as an empty response) that should be retried."""
     pass
 
 class ScraperCancelled(Exception):
@@ -82,11 +94,45 @@ class SiteBlocked(Exception):
     def __init__(self, url: str):
         super().__init__(f"{urlparse(url).netloc} shows a browser check, so the app cannot read its chapters.")
 
+CHALLENGE_MARKERS = (
+    'just a moment',
+    'cf-browser-verification',
+    '/cdn-cgi/challenge-platform',
+    'challenge-running',
+    'checking your browser',
+    'attention required! | cloudflare',
+)
+CF_403_MARKERS = CHALLENGE_MARKERS + ('access denied', 'error 1020', 'cloudflare')
+
 def is_browser_check(response: requests.Response) -> bool:
-    """True when the response is a Cloudflare check page instead of the requested page."""
-    return response.status_code in (403, 503) and (
-        response.headers.get('cf-mitigated') == 'challenge'
-        or 'cloudflare' in response.headers.get('server', '').lower())
+    """True when the response is a Cloudflare check/block page instead of the requested page."""
+    if response.status_code not in (403, 503):
+        return False
+    if response.headers.get('cf-mitigated', '').lower() == 'challenge':
+        return True
+    if 'cloudflare' not in response.headers.get('server', '').lower():
+        return False
+    body = (response.text or '').lower()
+    markers = CF_403_MARKERS if response.status_code == 403 else CHALLENGE_MARKERS
+    return any(marker in body for marker in markers)
+
+def parse_retry_after(header_value: Optional[str]) -> Optional[float]:
+    """Parse an HTTP Retry-After header (seconds or HTTP-date) into non-negative seconds."""
+    if not header_value:
+        return None
+    value = header_value.strip()
+    try:
+        seconds = float(value)
+        return max(0.0, seconds)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        return None
 
 class CallbackLogHandler(logging.Handler):
     def __init__(self, callback):
@@ -97,44 +143,42 @@ class CallbackLogHandler(logging.Handler):
         self.callback(self.format(record))
 
 class RateLimiter:
-    """Rate limiting implementation with exponential backoff."""
-   
-    def __init__(self, requests_per_second: float = ScraperConstants.DEFAULT_REQUESTS_PER_SECOND, cancel_event=None):
+    """Monotonic request pacing with bounded retry backoff."""
+
+    def __init__(self, requests_per_second: float = ScraperConstants.DEFAULT_REQUESTS_PER_SECOND,
+                 cancel_event=None, clock=time.monotonic):
         self.rate = requests_per_second
         self.min_interval = 1.0 / requests_per_second
-        self.last_request_times = deque(maxlen=10)
-        self.failed_attempts = 0
+        self._clock = clock
+        self._last_request_at: Optional[float] = None
         self.cancel_event = cancel_event
 
     def sleep(self, seconds: float) -> None:
-        if self.cancel_event is not None:
-            if self.cancel_event.wait(max(0, seconds)):
+        if seconds <= 0:
+            if self.cancel_event is not None and self.cancel_event.is_set():
                 raise ScraperCancelled()
-        elif seconds > 0:
-            time.sleep(seconds)
-       
-    def wait(self) -> None:
-        """Wait appropriate time between requests with exponential backoff."""
-        now = datetime.now()
-        
-        if self.last_request_times:
-            elapsed = (now - self.last_request_times[-1]).total_seconds()
-            wait_time = max(0, self.min_interval - elapsed)
+            return
+        if self.cancel_event is not None:
+            if self.cancel_event.wait(seconds):
+                raise ScraperCancelled()
         else:
-            wait_time = 0
+            time.sleep(seconds)
 
-        if self.failed_attempts > 0:
-            wait_time += min(300, (2 ** self.failed_attempts) - 1)
-            
-        self.sleep(wait_time)
-            
-        self.last_request_times.append(now)
-    
-    def record_failure(self) -> None:
-        self.failed_attempts += 1
-    
-    def record_success(self) -> None:
-        self.failed_attempts = 0
+    def wait(self) -> None:
+        """Wait until the minimum interval since the previous request has elapsed."""
+        if self._last_request_at is not None:
+            elapsed = self._clock() - self._last_request_at
+            self.sleep(self.min_interval - elapsed)
+        elif self.cancel_event is not None and self.cancel_event.is_set():
+            raise ScraperCancelled()
+        self._last_request_at = self._clock()
+
+    def retry_delay(self, attempt: int, retry_after: Optional[float] = None) -> float:
+        """Return a single bounded backoff delay for a retryable failure."""
+        backoff = min(60.0, float(2 ** attempt))
+        if retry_after is not None and retry_after > 0:
+            return min(300.0, max(backoff, retry_after))
+        return backoff
 
 class ProgressTracker:
     def __init__(self, total: int):
@@ -162,7 +206,7 @@ class ProgressTracker:
 
 class WebNovelScraper:
     def __init__(self, debug_mode: bool = False, settings=None, constants=None,
-                 cancel_event=None, log_callback=None, log_path='scraper_detailed.log'):
+                 cancel_event=None, log_callback=None, log_path: Optional[Union[str, Path]] = None):
         self.config = settings if settings is not None else Config
         self.constants = constants if constants is not None else ScraperConstants
         self._initialize_logging(debug_mode, log_callback, log_path)
@@ -171,13 +215,26 @@ class WebNovelScraper:
         self.debug_mode = debug_mode
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        self._closed = False
 
-    def _initialize_logging(self, debug_mode: bool, log_callback=None, log_path='scraper_detailed.log') -> None:
+    def __enter__(self) -> 'WebNovelScraper':
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _initialize_logging(self, debug_mode: bool, log_callback=None,
+                            log_path: Optional[Union[str, Path]] = None) -> None:
         log_level = logging.DEBUG if debug_mode else logging.INFO
         self.logger = logging.Logger(__name__, log_level)
-        handlers = [logging.FileHandler(log_path, encoding='utf-8')]
+        handlers: List[logging.Handler] = []
+        if log_path is not None:
+            handlers.append(logging.FileHandler(log_path, encoding='utf-8'))
         if log_callback is not None:
-            handlers.append(CallbackLogHandler(log_callback))
+            cb_handler = CallbackLogHandler(log_callback)
+            # Keep raw debug HTML dumps out of the GUI activity log; full debug stays in the file log.
+            cb_handler.setLevel(logging.INFO)
+            handlers.append(cb_handler)
         elif debug_mode:
             handlers.append(logging.StreamHandler())
         for handler in handlers:
@@ -185,6 +242,9 @@ class WebNovelScraper:
             self.logger.addHandler(handler)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self.session.close()
         for handler in self.logger.handlers[:]:
             handler.close()
@@ -278,10 +338,39 @@ class WebNovelScraper:
         # Then check regular text patterns, as whole words so story text such as "was always" stays
         return bool(NOTE_TEXT.search(text))
 
+    def _is_math_exponent(self, sup) -> bool:
+        """True when an unbracketed numeric <sup> follows a number or short unit (e.g. 10^2, 5m^2, <em>5m</em>^2)."""
+        sup_text = sup.get_text(strip=True)
+        if sup_text.startswith('[') and sup_text.endswith(']'):
+            return False
+        prev = sup.previous_sibling
+        while prev is not None:
+            if isinstance(prev, Comment):
+                prev = prev.previous_sibling
+                continue
+            prev_text = str(prev) if isinstance(prev, NavigableString) else prev.get_text()
+            if prev_text:
+                return bool(re.search(r'(?:\d|\d\s*[A-Za-z]{1,3})$', prev_text))
+            prev = prev.previous_sibling
+        return False
+
+    def _collect_footnote_refs(self, content_div: BeautifulSoup) -> Set[str]:
+        """Collect footnote numbers referenced by <sup> tags or [n] markers in the chapter."""
+        refs: Set[str] = set()
+        for sup in content_div.find_all('sup'):
+            match = re.fullmatch(r'\[?(\d{1,2})\]?', sup.get_text(strip=True))
+            if match and not self._is_math_exponent(sup):
+                refs.add(match.group(1))
+        for text in _texts(content_div):
+            for match in FOOTNOTE_MARK.finditer(text):
+                refs.add(match.group(1) or match.group(2))
+        return refs
+
     def _process_content(self, content_div: BeautifulSoup) -> Tuple[List[str], List[str], Dict[str, str], List[str]]:
         """Process and extract content components."""
         content_div = self._clean_html_content(content_div)
         wrap_loose_text(content_div)
+        referenced_footnotes = self._collect_footnote_refs(content_div)
         tidy_for_speech(content_div, keep_notes=self.config.INCLUDE_CHAPTER_NOTES,
                         keep_footnotes=self.config.INCLUDE_FOOTNOTES)
 
@@ -289,13 +378,11 @@ class WebNovelScraper:
         after_separator = []
         footnotes = {}
         debug_notes = []
-        found_separator = False
-        in_main_content = True
-        
+
         if self.debug_mode:
             self.logger.debug("\nRaw content before processing:")
             self.logger.debug(content_div.prettify())
-        
+
         for p in content_div.find_all('p'):
             trim_paragraph(p)
             text = p.text.strip()
@@ -304,6 +391,11 @@ class WebNovelScraper:
 
             if self.debug_mode:
                 self.logger.debug(f"\nProcessing paragraph: {text[:100]}...")
+
+            fn_match = FOOTNOTE_LINE.match(text)
+            is_footnote = bool(
+                fn_match and (fn_match.group(1) in referenced_footnotes or LABELED_FOOTNOTE.match(text))
+            )
 
             # Always add to main content unless it's clearly a note
             if SEPARATOR_LINE.match(text):
@@ -318,14 +410,14 @@ class WebNovelScraper:
                 debug_notes.append(f"Start note: {str(p)}")
                 if self.debug_mode:
                     self.logger.debug("Found start note")
-            elif text.startswith(tuple(str(i) + '.' for i in range(1, 10))) and ':' in text:
+            elif is_footnote:
+                num, body = fn_match.group(1), fn_match.group(2).strip()
                 if self.config.INCLUDE_FOOTNOTES:
-                    footnotes[text.split('.')[0]] = text
+                    footnotes[num] = body
                 debug_notes.append(f"Footnote: {text}")
                 if self.debug_mode:
                     self.logger.debug("Found footnote")
             elif self._is_note_or_message(text, p):
-                found_separator = True
                 if self.config.INCLUDE_CHAPTER_NOTES:
                     after_separator.append(str(p))
                 debug_notes.append(f"End note: {str(p)}")
@@ -353,40 +445,59 @@ class WebNovelScraper:
         return paragraphs, after_separator, footnotes, debug_notes
 
     def get_chapter_content(self, url: str) -> Tuple[Optional[str], Optional[str], Optional[List[str]], Optional[dict]]:
-        """Fetch and process chapter content."""
+        """Fetch and process chapter content, retrying only transient errors."""
         if not self.validate_url(url):
             raise ValidationError("Invalid chapter URL")
 
         for attempt in range(self.constants.MAX_RETRIES):
+            retry_after: Optional[float] = None
             try:
                 self.rate_limiter.wait()
-                
+
                 response = self.session.get(url, timeout=self.constants.DEFAULT_TIMEOUT)
                 if is_browser_check(response):
                     raise SiteBlocked(url)
                 response.raise_for_status()
-                
+
                 if not response.text.strip():
-                    raise ValueError("Empty response received")
-                
+                    raise _RetryableFetchError("Empty response received")
+
                 soup = BeautifulSoup(response.text, 'html.parser')
                 chapter = self.parse_chapter(soup.select_one(self.constants.TITLE_SELECTOR),
                                              soup.select_one(self.constants.CONTENT_SELECTOR), url)
-                self.rate_limiter.record_success()
                 return chapter
 
-            except (ScraperCancelled, SiteBlocked):
+            except (ScraperCancelled, SiteBlocked, ValidationError):
                 raise
-            except Exception as e:
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                retryable = status is None or status in (408, 429) or status >= 500
+                if e.response is not None and status in (429, 503):
+                    retry_after = parse_retry_after(e.response.headers.get('Retry-After'))
+                self.logger.error(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
+                if not retryable:
+                    return None, None, None, None
+            except ValueError as e:
+                # Missing title/container or too-short text on a 200 OK page will not be fixed by retrying.
+                self.logger.error(f"Chapter parsing failed for {url}: {str(e)}")
+                return None, None, None, None
+            except (_RetryableFetchError, requests.RequestException) as e:
                 self.logger.error(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
                 if self.debug_mode:
                     import traceback
                     self.logger.error(traceback.format_exc())
-                self.rate_limiter.record_failure()
-                if attempt < self.constants.MAX_RETRIES - 1:
-                    self.rate_limiter.sleep((attempt + 1) * 5)
-                else:
-                    return None, None, None, None
+            except Exception as e:
+                # Never let one malformed chapter's unexpected error abort an entire multi-chapter job.
+                self.logger.error(f"Unexpected error processing {url}: {str(e)}")
+                if self.debug_mode:
+                    import traceback
+                    self.logger.error(traceback.format_exc())
+                return None, None, None, None
+
+            if attempt < self.constants.MAX_RETRIES - 1:
+                self.rate_limiter.sleep(self.rate_limiter.retry_delay(attempt, retry_after))
+            else:
+                return None, None, None, None
 
         return None, None, None, None
 
@@ -429,7 +540,7 @@ class WebNovelScraper:
 
         return chapter_title, content, after_separator, footnotes
 
-    def parse_saved_chapter(self, section: BeautifulSoup, number: Union[int, float]) ->Tuple[Optional[str], Optional[str], Optional[List[str]], Optional[dict]]:
+    def parse_saved_chapter(self, section: BeautifulSoup, number: Union[int, float, str]) -> Tuple[Optional[str], Optional[str], Optional[List[str]], Optional[dict]]:
         """Process one chapter saved by browser/collect-chapters.js; returns Nones when it is unusable."""
         try:
             return self.parse_chapter(section.select_one('.chapter-title'),
@@ -449,35 +560,49 @@ class WebNovelScraper:
 
     def _format_chapter_content(self, paragraphs: List[str], footnotes: Dict[str, str]) -> str:
         processed_paragraphs = []
+        assigned_ref_ids: Set[str] = set()
         for p in paragraphs:
-            if self.config.INCLUDE_FOOTNOTES:
-                soup_p = BeautifulSoup(p, 'html.parser')
-                for sup in soup_p.find_all('sup'):
-                    ref_num = sup.text.strip()
-                    if ref_num in footnotes:
-                        sup['id'] = f'ref-{ref_num}'
-                        sup.wrap(soup_p.new_tag('a', href=f'#footnote-{ref_num}'))
-                processed_paragraphs.append(str(soup_p))
-            else:
-                p_clean = re.sub(r'<sup>.*?</sup>', '', p)
-                processed_paragraphs.append(p_clean)
-        
+            if '<sup' not in p.lower():
+                processed_paragraphs.append(p)
+                continue
+            soup_p = BeautifulSoup(p, 'html.parser')
+            for sup in soup_p.find_all('sup'):
+                ref_text = sup.get_text(strip=True)
+                sup_match = FOOTNOTE_SUP.fullmatch(ref_text)
+                ref_key = sup_match.group(1) if sup_match and sup_match.group(1) else ref_text
+                if self.config.INCLUDE_FOOTNOTES:
+                    if ref_key in footnotes and not self._is_math_exponent(sup):
+                        if ref_key not in assigned_ref_ids:
+                            sup['id'] = f'ref-{ref_key}'
+                            assigned_ref_ids.add(ref_key)
+                        sup.wrap(soup_p.new_tag('a', href=f'#footnote-{ref_key}'))
+                elif sup_match and not self._is_math_exponent(sup):
+                    sup.decompose()
+            processed_paragraphs.append(str(soup_p))
+
         return "\n".join(processed_paragraphs)
 
+def build_epub_identifier(title: str, source_key: str, first: object, last: object) -> str:
+    """Return a deterministic urn:uuid unique to a book's title, source, and effective chapter bounds."""
+    seed = f'webnovelscraper:{title.strip()}|{source_key}|{first}-{last}'
+    return f'urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, seed)}'
+
 class EpubCreator:
-    def __init__(self, novel_title: str, author: str = "Unknown", 
-                    translator: str = "", created_by: str = "WebNovelScraper", settings=None, language: str = "en"):
+    def __init__(self, novel_title: str, author: str = "Unknown",
+                 translator: str = "", created_by: str = "WebNovelScraper",
+                 settings=None, language: str = "en", identifier: Optional[str] = None):
         self.config = settings if settings is not None else Config
         self.language = language
         self.novel_title = novel_title
         self.author = author
         self.translator = translator
         self.created_by = created_by
+        self.identifier = identifier or f'urn:uuid:{uuid.uuid4()}'
         self.book = epub.EpubBook()
         self._initialize_book()
 
     def _initialize_book(self) -> None:
-        self.book.set_identifier(f'id_{self.novel_title.lower().replace(" ", "_")}')
+        self.book.set_identifier(self.identifier)
         self.book.set_title(self.novel_title)
         self.book.set_language(self.language)
         
@@ -504,7 +629,7 @@ class EpubCreator:
         chapter_content += ['<div class="chapter-content">', chapter_data['content']]
 
         if self.config.INCLUDE_FOOTNOTES and chapter_data['footnotes']:
-            chapter_content.extend(self._format_footnotes(chapter_data['footnotes']))
+            chapter_content.extend(self._format_footnotes(chapter_data['footnotes'], chapter_data['content']))
             
         if self.config.INCLUDE_CHAPTER_NOTES and chapter_data['notes']:
             chapter_content.extend(self._format_chapter_notes(chapter_data['notes']))
@@ -515,16 +640,16 @@ class EpubCreator:
         self.book.add_item(chapter)
         return chapter
 
-    def _format_footnotes(self, footnotes: Dict[str, str]) -> List[str]:
-        return [
-            '<div class="footnotes">',
-            '<hr/>',
-            '<h3>Footnotes</h3>',
-            *[f'<p id="footnote-{num}" class="footnote"><sup>{num}</sup> {text} '
-                f'<a href="#ref-{num}">↩</a></p>'
-                for num, text in footnotes.items()],
-            '</div>'
-        ]
+    def _format_footnotes(self, footnotes: Dict[str, str], body_html: str = '') -> List[str]:
+        items = ['<div class="footnotes">', '<hr/>', '<h3>Footnotes</h3>']
+        for num, text in footnotes.items():
+            esc_num = escape(num)
+            backlink = f' <a href="#ref-{esc_num}">↩</a>' if f'id="ref-{esc_num}"' in body_html else ''
+            items.append(
+                f'<p id="footnote-{esc_num}" class="footnote"><sup>{esc_num}</sup> {escape(text)}{backlink}</p>'
+            )
+        items.append('</div>')
+        return items
 
     def _format_chapter_notes(self, notes: List[str]) -> List[str]:
         return [
@@ -645,8 +770,8 @@ NOTE_IN_BRACKETS = re.compile(rf'\s*\({TL_NOTE_START}(?:[^()]|\([^()]*\))*\)', r
 # A link in brackets, or on its own without the punctuation after it. Links may hold brackets: /wiki/Foo_(bar).
 URL = r'https?://(?:[^\s()]|\([^\s()]*\))*'
 LINK = re.compile(rf'\s*\(\s*{URL}\s*\)|\s*{URL}(?<![.,;:!?\'"”’])')
-# A footnote mark after a word or a sentence ("collapse. [1] Deals"), but not values such as "Strength [15]".
-FOOTNOTE_MARK = re.compile(r'(?<=[A-Za-z])\[\d{1,2}\]|(?<=[.,;:!?”"’)])\s*\[\d{1,2}\]')
+# A footnote mark after a word or a sentence ("collapse. [1] Deals"), but not values such as "Strength [15]" or "Level: [5]".
+FOOTNOTE_MARK = re.compile(r'(?<=[A-Za-z])\[(\d{1,2})\]|(?<=[.,;!?”"’)])\s*\[(\d{1,2})\]')
 # The "[email protected]" placeholder some sites put in place of censored words, decorative symbols,
 # and tildes stretching a word ("Jack~~pot", "Oppa~"); ranges such as "Monday~Friday" stay.
 NOISE = re.compile(r'\[email(?:\s|\xa0)protected\]|[★☆■□▲△▼▽◆◇●○►◄▶◀※♥♡❤♪♫]\s*'
@@ -724,17 +849,161 @@ def wrap_loose_text(content_div: BeautifulSoup) -> None:
                 paragraph.append(part.extract())
         run = []
 
+CHAPTER_NUMBER_PATTERN = re.compile(r'^\d+(?:\.\d+)?$')
+
+class _SavedChapterScanner(HTMLParser):
+    """Streaming attribute-order-independent scanner for saved chapter HTML files."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.sources: List[str] = []
+        self.numbers: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        tag_name = tag.lower()
+        if tag_name not in ('meta', 'section'):
+            return
+        attr_map = {k.lower(): (v or '') for k, v in attrs}
+        if tag_name == 'meta' and attr_map.get('name', '').strip().lower() == 'source':
+            source = attr_map.get('content', '').strip()
+            if source:
+                self.sources.append(source)
+        elif tag_name == 'section':
+            classes = attr_map.get('class', '').split()
+            if 'wns-chapter' in classes and 'data-number' in attr_map:
+                self.numbers.append(attr_map['data-number'])
+
+@dataclass
+class SavedChapter:
+    key: Tuple[int, ...]
+    raw_number: str
+    numeric: Union[int, float]
+    major: int
+    section: BeautifulSoup
+    source: str = ''
+    file_path: Optional[Path] = None
+
+@dataclass
+class SavedChaptersLoad:
+    chapters: List[SavedChapter] = field(default_factory=list)
+    sources: List[str] = field(default_factory=list)
+    duplicates: List[str] = field(default_factory=list)
+    invalid_count: int = 0
+
+def _parse_chapter_number(raw: str) -> Optional[Tuple[Tuple[int, ...], Union[int, float], int]]:
+    cleaned = raw.strip()
+    if not CHAPTER_NUMBER_PATTERN.fullmatch(cleaned):
+        return None
+    parts = tuple(int(part) for part in cleaned.split('.'))
+    # Normalize "1.0" to (1,) so it matches "1", while keeping "1.1" and "1.10" distinct.
+    if len(parts) == 2 and parts[1] == 0:
+        parts = (parts[0],)
+    major = parts[0]
+    if len(parts) == 1:
+        numeric: Union[int, float] = major
+    else:
+        val = float(cleaned)
+        numeric = int(val) if val.is_integer() else val
+    return parts, numeric, major
+
+def _saved_html_files(location) -> List[Path]:
+    path_obj = Path(location).expanduser()
+    if not path_obj.exists():
+        return []
+    return [path_obj] if path_obj.is_file() else sorted(path_obj.glob('*.html'))
+
+def scan_saved_chapters(location) -> Dict[str, object]:
+    """Quickly scan saved chapter files for range and diagnostics without full DOM parsing."""
+    files = _saved_html_files(location)
+    keys: Dict[Tuple[int, ...], int] = {}
+    sources_seen: List[str] = []
+    duplicates_seen: List[str] = []
+    for path in files:
+        try:
+            text = path.read_text(encoding='utf-8')
+        except UnicodeDecodeError as error:
+            raise ValueError(f'Could not read {path.name} as UTF-8 text.') from error
+        scanner = _SavedChapterScanner()
+        scanner.feed(text)
+        scanner.close()
+        for source in scanner.sources:
+            if source not in sources_seen:
+                sources_seen.append(source)
+        for raw in scanner.numbers:
+            parsed = _parse_chapter_number(raw)
+            if parsed is None:
+                continue
+            key, _, major = parsed
+            if key in keys:
+                if raw.strip() not in duplicates_seen:
+                    duplicates_seen.append(raw.strip())
+            else:
+                keys[key] = major
+    if not keys:
+        return {'count': 0, 'first': None, 'last': None, 'sources': sources_seen, 'duplicates': duplicates_seen}
+    ordered_keys = sorted(keys)
+    return {
+        'count': len(ordered_keys),
+        'first': keys[ordered_keys[0]],
+        'last': keys[ordered_keys[-1]],
+        'sources': sources_seen,
+        'duplicates': duplicates_seen,
+    }
+
+def load_saved_chapters(location) -> SavedChaptersLoad:
+    """Read chapters saved by browser/collect-chapters.js with source and duplicate diagnostics."""
+    files = _saved_html_files(location)
+    by_key: Dict[Tuple[int, ...], SavedChapter] = {}
+    sources_seen: List[str] = []
+    duplicates_seen: List[str] = []
+    invalid_count = 0
+
+    for path in files:
+        try:
+            text = path.read_text(encoding='utf-8')
+        except UnicodeDecodeError as error:
+            raise ValueError(f'Could not read {path.name} as UTF-8 text.') from error
+        soup = BeautifulSoup(text, 'html.parser')
+        source_meta = soup.find('meta', attrs={'name': 'source'})
+        source = (source_meta.get('content') or '').strip() if source_meta else ''
+        if source and source not in sources_seen:
+            sources_seen.append(source)
+        for section in soup.select('section.wns-chapter[data-number]'):
+            raw = str(section.get('data-number', '')).strip()
+            parsed = _parse_chapter_number(raw)
+            if parsed is None:
+                invalid_count += 1
+                continue
+            key, numeric, major = parsed
+            candidate = SavedChapter(
+                key=key,
+                raw_number=raw,
+                numeric=numeric,
+                major=major,
+                section=section,
+                source=source,
+                file_path=path,
+            )
+            if key in by_key:
+                if raw not in duplicates_seen:
+                    duplicates_seen.append(raw)
+                # Prefer the copy with more text rather than letting filename sort win silently.
+                if len(section.get_text(strip=True)) >= len(by_key[key].section.get_text(strip=True)):
+                    by_key[key] = candidate
+            else:
+                by_key[key] = candidate
+
+    ordered = [by_key[key] for key in sorted(by_key)]
+    return SavedChaptersLoad(
+        chapters=ordered,
+        sources=sources_seen,
+        duplicates=duplicates_seen,
+        invalid_count=invalid_count,
+    )
+
 def read_saved_chapters(location) -> List[Tuple[Union[int, float], BeautifulSoup]]:
     """Read chapters saved by browser/collect-chapters.js from one .html file, or every one in a folder, in chapter order."""
-    location = Path(location).expanduser()
-    chapters = {}
-    for path in [location] if location.is_file() else sorted(location.glob('*.html')):
-        soup = BeautifulSoup(path.read_text(encoding='utf-8'), 'html.parser')
-        for section in soup.select('section.wns-chapter[data-number]'):
-            # In-between chapters such as 769.1 keep their decimal number.
-            number = float(section['data-number'])
-            chapters[int(number) if number.is_integer() else number] = section
-    return sorted(chapters.items())
+    return [(chapter.numeric, chapter.section) for chapter in load_saved_chapters(location).chapters]
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Web Novel Scraper')
@@ -907,69 +1176,79 @@ def main() -> None:
             print("Aborted by user.")
             return
 
-        scraper = WebNovelScraper(debug_mode=Config.DEBUG_MODE)
-        first, last = inputs['start_chapter'], inputs['end_chapter']
-        if args.from_folder:
-            saved = [(number, section) for number, section in read_saved_chapters(args.from_folder)
-                     if first <= number <= last]
-            if not saved:
-                raise ValidationError(f"No saved chapters found in {args.from_folder}")
-            total = len(saved)
-            results = ((number, scraper.parse_saved_chapter(section, number)) for number, section in saved)
-        else:
-            numbers = range(first, last + 1)
-            total = len(numbers)
-            results = ((number, scraper.get_chapter_content(
-                f"{inputs['base_url']}{inputs['novel_id']}/{args.chapter_prefix}{number}")) for number in numbers)
-        progress = ProgressTracker(total)
-
-        chapters_data = []
-        epub_creator = EpubCreator(
-            inputs['novel_title'],
-            author=inputs['author'],
-            translator=inputs['translator'],
-            created_by=inputs['created_by']
-        )
-
-        if inputs['cover_url']:
-            cover_data = scraper.get_cover_image(inputs['cover_url'])
-            if cover_data:
-                epub_creator.add_cover(cover_data)
+        with WebNovelScraper(debug_mode=Config.DEBUG_MODE, log_path='scraper_detailed.log') as scraper:
+            first, last = inputs['start_chapter'], inputs['end_chapter']
+            if args.from_folder:
+                loaded = load_saved_chapters(args.from_folder)
+                saved = [ch for ch in loaded.chapters if first <= ch.major <= last]
+                if not saved:
+                    raise ValidationError(f"No saved chapters found in {args.from_folder}")
+                total = len(saved)
+                results = ((ch.raw_number, scraper.parse_saved_chapter(ch.section, ch.raw_number)) for ch in saved)
+                id_source = (
+                    ','.join(loaded.sources)
+                    if loaded.sources
+                    else str(Path(args.from_folder).expanduser().resolve())
+                )
+                id_first, id_last = saved[0].raw_number, saved[-1].raw_number
             else:
-                print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process cover image{ConsoleColors.RESET}")
+                numbers = range(first, last + 1)
+                total = len(numbers)
+                results = ((number, scraper.get_chapter_content(
+                    f"{inputs['base_url']}{inputs['novel_id']}/{args.chapter_prefix}{number}")) for number in numbers)
+                id_source = f"{inputs['base_url'].rstrip('/')}/{inputs['novel_id']}/{args.chapter_prefix}"
+                id_first, id_last = first, last
+            progress = ProgressTracker(total)
 
-        for chapter_num, (chapter_title, content, notes, footnotes) in results:
-            if chapter_title and content:
-                chapters_data.append({
-                    'title': chapter_title,
-                    'content': content,
-                    'notes': notes or [],
-                    'footnotes': footnotes or {}
-                })
-                progress.update(True)
+            chapters_data = []
+            cli_identifier = build_epub_identifier(inputs['novel_title'], id_source, id_first, id_last)
+            epub_creator = EpubCreator(
+                inputs['novel_title'],
+                author=inputs['author'],
+                translator=inputs['translator'],
+                created_by=inputs['created_by'],
+                identifier=cli_identifier,
+            )
+
+            if inputs['cover_url']:
+                cover_data = scraper.get_cover_image(inputs['cover_url'])
+                if cover_data:
+                    epub_creator.add_cover(cover_data)
+                else:
+                    print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process cover image{ConsoleColors.RESET}")
+
+            for chapter_num, (chapter_title, content, notes, footnotes) in results:
+                if chapter_title and content:
+                    chapters_data.append({
+                        'title': chapter_title,
+                        'content': content,
+                        'notes': notes or [],
+                        'footnotes': footnotes or {}
+                    })
+                    progress.update(True)
+                else:
+                    progress.update(False)
+                    print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process chapter {chapter_num}{ConsoleColors.RESET}")
+
+            if chapters_data:
+                epub_chapters = []
+                for idx, chapter_data in enumerate(chapters_data, 1):
+                    chapter = epub_creator.add_chapter(chapter_data, idx)
+                    epub_chapters.append(chapter)
+
+                epub_creator.finalize(epub_chapters)
+                epub_filename = f"{inputs['novel_title'].lower().replace(' ', '_')}.epub"
+
+                try:
+                    epub.write_epub(epub_filename, epub_creator.book, {})
+                    print(f"\n{ConsoleColors.GREEN}Successfully created: {epub_filename}{ConsoleColors.RESET}")
+                    print(f"Total chapters: {len(chapters_data)}")
+                    print(f"Successful: {progress.success}")
+                    print(f"Failed: {progress.failures}")
+                except Exception as e:
+                    print(f"\n{ConsoleColors.RED}Error creating EPUB file: {str(e)}{ConsoleColors.RESET}")
             else:
-                progress.update(False)
-                print(f"\n{ConsoleColors.YELLOW}Warning: Failed to process chapter {chapter_num}{ConsoleColors.RESET}")
-
-        if chapters_data:
-            epub_chapters = []
-            for idx, chapter_data in enumerate(chapters_data, 1):
-                chapter = epub_creator.add_chapter(chapter_data, idx)
-                epub_chapters.append(chapter)
-
-            epub_creator.finalize(epub_chapters)
-            epub_filename = f"{inputs['novel_title'].lower().replace(' ', '_')}.epub"
-            
-            try:
-                epub.write_epub(epub_filename, epub_creator.book, {})
-                print(f"\n{ConsoleColors.GREEN}Successfully created: {epub_filename}{ConsoleColors.RESET}")
-                print(f"Total chapters: {len(chapters_data)}")
-                print(f"Successful: {progress.success}")
-                print(f"Failed: {progress.failures}")
-            except Exception as e:
-                print(f"\n{ConsoleColors.RED}Error creating EPUB file: {str(e)}{ConsoleColors.RESET}")
-        else:
-            print(f"\n{ConsoleColors.RED}No chapters were successfully scraped.{ConsoleColors.RESET}")
+                print(f"\n{ConsoleColors.RED}No chapters were successfully scraped.{ConsoleColors.RESET}")
 
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")

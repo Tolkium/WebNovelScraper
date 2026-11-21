@@ -71,25 +71,91 @@
   const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const [linkStart, linkEnd] = config.chapterUrl.split('{n}').map(escapeRegExp);
   const inBetweenLink = new RegExp(`^${linkStart}(\\d+\\.\\d+)${linkEnd}/?(?:[?#].*)?$`);
-  // In-between chapters, such as 769.1 after 769, that the page links to.
+  function majorOf(id) {
+    return parseInt(String(id).split('.')[0], 10);
+  }
+  function compareChapterIds(a, b) {
+    const partsA = String(a).split('.').map(Number);
+    const partsB = String(b).split('.').map(Number);
+    const len = Math.max(partsA.length, partsB.length);
+    for (let i = 0; i < len; i++) {
+      const diff = (partsA[i] || 0) - (partsB[i] || 0);
+      if (diff !== 0) return diff;
+    }
+    return 0;
+  }
+  // In-between chapters, such as 769.1 or 1.10 after 1, that the page links to.
   function inBetweenNumbers(doc, number) {
-    const whole = Math.floor(number);
+    const whole = majorOf(number);
     const found = new Set();
     for (const link of doc.querySelectorAll('a[href]')) {
       const match = new URL(link.getAttribute('href'), chapterUrl(number)).href.match(inBetweenLink);
-      const linked = match ? Number(match[1]) : 0;
-      if (linked > whole && linked < whole + 1) found.add(linked);
+      if (!match) continue;
+      const raw = match[1];
+      const parts = raw.split('.');
+      if (Number(parts[0]) === whole && Number(parts[1]) > 0) found.add(raw);
     }
-    return [...found].sort((a, b) => a - b);
+    return [...found].sort(compareChapterIds);
   }
+  let running = false;
+  let stopped = false;
+  let cancelWait = null;
+
+  function wait(ms) {
+    if (stopped || ms <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        cancelWait = null;
+        resolve();
+      }, ms);
+      cancelWait = () => {
+        clearTimeout(timer);
+        cancelWait = null;
+        resolve();
+      };
+    });
+  }
+
+  function retryAfterMs(response) {
+    const header = response.headers.get('retry-after');
+    if (!header) return 0;
+    const seconds = Number(header);
+    if (!Number.isNaN(seconds) && seconds > 0) return Math.min(seconds * 1000, 300000);
+    const when = Date.parse(header);
+    if (!Number.isNaN(when)) return Math.min(Math.max(0, when - Date.now()), 300000);
+    return 0;
+  }
+
   // Returns the chapter, or null when the page has no chapter text.
+  // Retries transient rate-limit / server / network errors (including body read drops) before giving up.
   async function loadChapter(number) {
-    const response = await fetch(chapterUrl(number), { credentials: 'same-origin' });
-    if (!response.ok || response.redirected) return null;
-    const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
-    const content = findContent(doc);
-    if (!content) return null;
-    return { number, title: findTitle(doc, content, number), html: content.innerHTML, inBetween: inBetweenNumbers(doc, number) };
+    const maxAttempts = 3;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (stopped) return null;
+      let response;
+      let htmlText;
+      try {
+        response = await fetch(chapterUrl(number), { credentials: 'same-origin' });
+        if (response.status === 429 || response.status >= 500) {
+          if (attempt === maxAttempts - 1 || stopped) return null;
+          const backoff = Math.max(DELAY_MS * (2 ** (attempt + 1)), retryAfterMs(response));
+          announce(`Chapter ${number} returned ${response.status}; retrying in ${Math.round(backoff / 1000)}s…`);
+          await wait(backoff);
+          continue;
+        }
+        if (!response.ok || response.redirected) return null;
+        htmlText = await response.text();
+      } catch (error) {
+        if (attempt === maxAttempts - 1 || stopped) throw error;
+        await wait(DELAY_MS * (2 ** (attempt + 1)));
+        continue;
+      }
+      const doc = new DOMParser().parseFromString(htmlText, 'text/html');
+      const content = findContent(doc);
+      if (!content) return null;
+      return { number: String(number), title: findTitle(doc, content, number), html: content.innerHTML, inBetween: inBetweenNumbers(doc, number) };
+    }
+    return null;
   }
   function save(chapters) {
     const first = chapters[0].number;
@@ -109,8 +175,6 @@
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
     return `Saved chapters ${first} to ${last} to ${link.download} in Downloads.`;
   }
-  let running = false;
-  let stopped = false;
   async function collect(start, end) {
     if (running) {
       announce('Already collecting. Type wnsStop() first.');
@@ -134,27 +198,34 @@
     const chapters = [];
     const seen = new Set();
     let pending = [];
-    let number = start;
+    let number = String(start);
     let message = '';
     announce(`Collecting chapters ${start} to ${end}.`);
     try {
-      while (number <= end && !stopped) {
-        if (chapters.length) await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
+      while (majorOf(number) <= end && !stopped) {
+        if (chapters.length) {
+          await wait(DELAY_MS);
+          if (stopped) break;
+        }
         const chapter = await loadChapter(number);
         if (!chapter) {
-          message = `Stopped: chapter ${number} did not show chapter text. Open it in this tab, complete any check, then paste the script again and start from chapter ${Math.floor(number)}. `;
+          if (!stopped) {
+            message = `Stopped: chapter ${number} did not show chapter text. Open it in this tab, complete any check, then paste the script again and start from chapter ${majorOf(number)}. `;
+          }
           break;
         }
         chapters.push(chapter);
         seen.add(number);
         announce(`Captured chapter ${number}.`);
-        pending = [...new Set([...pending, ...chapter.inBetween])].filter((extra) => !seen.has(extra)).sort((a, b) => a - b);
-        number = pending.length ? pending.shift() : Math.floor(number) + 1;
+        if (stopped) break;
+        pending = [...new Set([...pending, ...chapter.inBetween])].filter((extra) => !seen.has(extra)).sort(compareChapterIds);
+        number = pending.length ? pending.shift() : String(majorOf(number) + 1);
       }
     } catch (error) {
       message = `Stopped at chapter ${number}: ${error.message}. `;
     } finally {
       running = false;
+      cancelWait = null;
       announce(message + (chapters.length ? save(chapters) : 'No chapters were saved.'));
     }
   }
@@ -175,6 +246,7 @@
   window.wnsCollect = collect;
   window.wnsStop = () => {
     stopped = true;
+    if (cancelWait) cancelWait();
     announce('Stopping after the current chapter.');
   };
   askAndCollect();

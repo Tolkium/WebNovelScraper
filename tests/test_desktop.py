@@ -442,6 +442,76 @@ class DesktopTests(unittest.TestCase):
                 self.wait_until(lambda: window.thread is None)
             window.close()
 
+    def test_stale_access_check_does_not_open_dialog_after_switching_url(self):
+        window = self.window()
+        gate = Event()
+        second_done = Event()
+
+        def access_check(url, user_agent):
+            if url.endswith('/chapter-1'):
+                gate.wait(2)
+                return True
+            second_done.set()
+            return False
+
+        window.access_check = access_check
+        try:
+            with patch.object(QMessageBox, 'information') as information:
+                window.novel_url.setText(self.base + '/novel/slow-blocked/chapter-1')
+                window._use_url()
+                window.novel_url.setText(self.base + '/novel/fast-ok/chapter-2')
+                window._use_url()
+                self.wait_until(second_done.is_set)
+                gate.set()
+                # Process queued Qt events to confirm the stale check is ignored.
+                for _ in range(10):
+                    self.app.processEvents()
+                    time.sleep(0.01)
+                information.assert_not_called()
+        finally:
+            gate.set()
+            window.close()
+
+    def test_choosing_saved_file_or_folder_autofills_chapter_range(self):
+        saved_dir = self.root / 'saved_batch'
+        saved_dir.mkdir()
+        body = '<p>' + 'Story text for testing saved file import. ' * 6 + '</p>'
+        (saved_dir / 'part1.html').write_text(
+            '<!doctype html><html><head><meta charset="utf-8"><meta name="source" content="https://a/ch-{n}"></head><body>'
+            f'<section class="wns-chapter" data-number="12"><span class="chapter-title">Ch 12</span><div class="chapter-container">{body}</div></section>'
+            '</body></html>',
+            encoding='utf-8',
+        )
+        (saved_dir / 'part2.html').write_text(
+            '<!doctype html><html><head><meta charset="utf-8"><meta name="source" content="https://a/ch-{n}"></head><body>'
+            f'<section class="wns-chapter" data-number="45"><span class="chapter-title">Ch 45</span><div class="chapter-container">{body}</div></section>'
+            '</body></html>',
+            encoding='utf-8',
+        )
+        window = self.window()
+        try:
+            window._apply_saved_source(str(saved_dir))
+            settings = window._collect_settings()
+            self.assertEqual(settings.saved_file, str(saved_dir))
+            self.assertEqual((settings.start, settings.end), (12, 45))
+            self.assertIn('2 saved chapter(s) (12–45)', window.browser_status.text())
+
+            # Empty folder, non-UTF-8 file, and missing path are handled cleanly without crashing.
+            empty_dir = self.root / 'empty_saved'
+            empty_dir.mkdir()
+            window._apply_saved_source(str(empty_dir))
+            self.assertIn('No saved chapters', window.browser_status.text())
+
+            bad_file = self.root / 'bad.html'
+            bad_file.write_bytes(b'\xff\xfe\x00\x00')
+            window._apply_saved_source(str(bad_file))
+            self.assertIn('Could not read saved chapters', window.browser_status.text())
+
+            window._apply_saved_source(str(self.root / 'missing.html'))
+            self.assertIn('No saved chapters', window.browser_status.text())
+        finally:
+            window.close()
+
 
 if __name__ == '__main__':
     unittest.main()

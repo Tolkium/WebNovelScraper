@@ -195,14 +195,15 @@ class SavedChapterTests(unittest.TestCase):
         (self.folder / 'novel.html').write_text(saved_file((770, STORY), (769.1, STORY), (769, STORY)), encoding='utf-8')
         chapters = read_saved_chapters(self.folder)
         self.assertEqual([number for number, _ in chapters], [769, 769.1, 770])
-        scraper = WebNovelScraper(settings=Config(SIMPLE_CHAPTER_NAMES=True), log_path=self.folder / 'test.log')
-        number, section = chapters[1]
-        self.assertEqual(scraper.parse_saved_chapter(section, number)[0], 'Chapter 769.1')
+        with WebNovelScraper(settings=Config(SIMPLE_CHAPTER_NAMES=True)) as scraper:
+            number, section = chapters[1]
+            self.assertEqual(scraper.parse_saved_chapter(section, number)[0], 'Chapter 769.1')
 
     def test_saved_chapter_is_repaired_and_end_notes_removed(self):
         (self.folder / 'novel.html').write_text(saved_file((105, STORY + END_NOTES)), encoding='utf-8')
         [(number, section)] = read_saved_chapters(self.folder)
-        title, content, notes, _ = WebNovelScraper(log_path=self.folder / 'test.log').parse_saved_chapter(section, number)
+        with WebNovelScraper() as scraper:
+            title, content, notes, _ = scraper.parse_saved_chapter(section, number)
         self.assertEqual(title, 'Chapter 105')
         self.assertIn('The shield of the assassin was a Goddess gift.', content)
         for unwanted in ('Glossary', 'Current schedule', 'Patreon', '<p>Chapter 105</p>'):
@@ -212,13 +213,15 @@ class SavedChapterTests(unittest.TestCase):
         story = '<p> \n “A skill that permanently improves the <em>performance</em>.”' + ' More story.' * 20 + '</p>'
         (self.folder / 'novel.html').write_text(saved_file((98, story)), encoding='utf-8')
         [(number, section)] = read_saved_chapters(self.folder)
-        content = WebNovelScraper(log_path=self.folder / 'test.log').parse_saved_chapter(section, number)[1]
+        with WebNovelScraper() as scraper:
+            content = scraper.parse_saved_chapter(section, number)[1]
         self.assertIn('<p>“A skill that permanently improves the <em>performance</em>.”', content)
 
     def test_empty_saved_chapter_fails_without_stopping(self):
         (self.folder / 'novel.html').write_text(saved_file((7, '')), encoding='utf-8')
         [(number, section)] = read_saved_chapters(self.folder)
-        self.assertEqual(WebNovelScraper(log_path=self.folder / 'test.log').parse_saved_chapter(section, number), (None, None, None, None))
+        with WebNovelScraper() as scraper:
+            self.assertEqual(scraper.parse_saved_chapter(section, number), (None, None, None, None))
 
     def saved_job(self, **changes):
         settings = JobSettings(title='Saved Book', start=2, end=3, output_dir=str(self.folder),

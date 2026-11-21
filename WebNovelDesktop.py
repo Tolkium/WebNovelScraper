@@ -22,7 +22,7 @@ from PySide6.QtTextToSpeech import QTextToSpeech
 from desktop_service import (
     JobSettings, browser_script, read_epub, run_job, site_blocks_app, site_selectors, split_novel_url,
 )
-from WebNovelScraper import SiteBlocked
+from WebNovelScraper import SiteBlocked, scan_saved_chapters
 
 
 STYLE = """
@@ -178,7 +178,7 @@ class DownloadWorker(QObject):
 
 
 class DesktopWindow(QMainWindow):
-    site_blocked = Signal(str)
+    site_blocked = Signal(int, str)
     PAGE_NAMES =['Novel setup', 'EPUB options', 'Book details', 'Advanced', 'Activity', 'Library & reader']
     DESCRIPTIONS = [
         'Choose your novel, chapter range and where the book will be saved.',
@@ -199,12 +199,14 @@ class DesktopWindow(QMainWindow):
         self.worker = None
         self.cancel = Event()
         self.pending_close = False
+        self._closing = False
+        self._access_check_token = 0
         self.latest_path = None
         self.reader_chapters = []
         self.speech = None
         self.voices = []
         self.access_check = site_blocks_app
-        self.site_blocked.connect(self._show_browser_method)
+        self.site_blocked.connect(self._on_site_blocked)
         self.setWindowTitle('')
         self.resize(1180, 820)
         self.setMinimumSize(960, 690)
@@ -490,11 +492,12 @@ class DesktopWindow(QMainWindow):
         row.setContentsMargins(0, 0, 0, 0)
         self.controls['saved_file'] = QLineEdit()
         self.controls['saved_file'].setPlaceholderText('Leave empty to download from the website')
-        self.controls['saved_file'].setAccessibleName('Saved chapters file')
+        self.controls['saved_file'].setAccessibleName('Saved chapters file or folder')
         self.controls['saved_file'].textChanged.connect(self._refresh_summary)
         row.addWidget(self.controls['saved_file'], 1)
         row.addWidget(self._button('Browse…', self._choose_saved_file))
-        self._add_form_row(saved_form, 'Saved chapters file', saved)
+        row.addWidget(self._button('Folder…', self._choose_saved_folder))
+        self._add_form_row(saved_form, 'Saved chapters', saved)
         self.browser_panel.setVisible(False)
         source.addWidget(self.browser_panel)
         form = self._form(source)
@@ -910,16 +913,31 @@ class DesktopWindow(QMainWindow):
         self.controls['content_selector'].setText(content_selector)
         self.statusBar().showMessage('Source filled in. Add your book title and chapter range.')
         user_agent = self.controls['user_agent'].text().strip() or JobSettings.user_agent
-        Thread(target=self._check_access, args=(url, user_agent), daemon=True).start()
+        self._access_check_token += 1
+        token = self._access_check_token
+        Thread(target=self._check_access, args=(token, url, user_agent), daemon=True).start()
 
-    def _check_access(self, url, user_agent):
+    def _check_access(self, token, url, user_agent):
         """Runs off the GUI thread; the signal brings the result back to it."""
+        if self._closing or token != self._access_check_token:
+            return
         if self.access_check(url, user_agent):
-            self.site_blocked.emit(str(SiteBlocked(url)))
+            if self._closing or token != self._access_check_token:
+                return
+            try:
+                self.site_blocked.emit(token, str(SiteBlocked(url)))
+            except RuntimeError:
+                pass
+
+    @Slot(int, str)
+    def _on_site_blocked(self, token, message):
+        if self._closing or self.pending_close or token != self._access_check_token:
+            return
+        self._show_browser_method(message)
 
     @Slot(str)
     def _show_browser_method(self, message):
-        if self.pending_close:
+        if self._closing or self.pending_close:
             return
         self.browser_toggle.setChecked(True)
         self.nav.setCurrentRow(0)
@@ -947,13 +965,45 @@ class DesktopWindow(QMainWindow):
         self.browser_status.setText(text)
         self.statusBar().showMessage(text)
 
+    def _apply_saved_source(self, location):
+        self.controls['saved_file'].setText(location)
+        try:
+            summary_info = scan_saved_chapters(location)
+        except (OSError, ValueError) as error:
+            self.browser_status.setText(f'Could not read saved chapters: {error}')
+            return
+        if summary_info['count'] == 0:
+            self.browser_status.setText('No saved chapters were found in the selected file or folder.')
+            return
+        first_major = summary_info['first']
+        last_major = summary_info['last']
+        self.controls['start'].setValue(first_major)
+        self.controls['end'].setValue(last_major)
+        notes = []
+        if len(summary_info['sources']) > 1:
+            notes.append(f'{len(summary_info["sources"])} different sources detected')
+        if summary_info['duplicates']:
+            notes.append(f'{len(summary_info["duplicates"])} duplicate chapter(s)')
+        suffix = f' ({"; ".join(notes)})' if notes else ''
+        summary = f'Found {summary_info["count"]} saved chapter(s) ({first_major}–{last_major}){suffix}.'
+        self.browser_status.setText(summary)
+        self.statusBar().showMessage(summary)
+
     def _choose_saved_file(self):
         current = self.controls['saved_file'].text()
         downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
         name, _ = QFileDialog.getOpenFileName(self, 'Choose the saved chapters file', current or downloads,
                                               'Saved chapters (*.html)')
         if name:
-            self.controls['saved_file'].setText(name)
+            self._apply_saved_source(name)
+
+    def _choose_saved_folder(self):
+        current = self.controls['saved_file'].text()
+        start_dir = str(Path(current).parent) if current and Path(current).is_file() else current
+        downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+        folder = QFileDialog.getExistingDirectory(self, 'Choose a folder of saved chapters', start_dir or downloads)
+        if folder:
+            self._apply_saved_source(folder)
 
     def _choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Choose EPUB output folder', self.controls['output_dir'].text())
@@ -962,6 +1012,7 @@ class DesktopWindow(QMainWindow):
 
     def _new_project(self):
         if QMessageBox.question(self, 'New project', 'Clear the current draft and start a new book?') == QMessageBox.StandardButton.Yes:
+            self._access_check_token += 1
             self._apply_settings(self._defaults())
             self.novel_url.clear()
             self.nav.setCurrentRow(0)
@@ -1300,6 +1351,8 @@ class DesktopWindow(QMainWindow):
                     self._cancel_job()
             event.ignore()
             return
+        self._closing = True
+        self._access_check_token += 1
         self._stop_speech()
         self._save_preferences()
         event.accept()
